@@ -854,6 +854,39 @@ def write_pcb(pcb, out, sim, names, origin, cell, width, via, rip=True):
     return nseg, nvia
 
 
+def write_seed(pcb, out, sim, names, origin, cell, board, length, vias, cont, stretch, tiers):
+    """Seed file for a topological router: per net the traced tube polylines (cell centres, mm, KiCad frame, one
+    per source terminal down to the sink or into an earlier branch), split into runs per layer with the via
+    positions between them, plus the scores. Raw cell-centre polylines, not smoothed: the consumer maps them onto
+    its own obstacle graph (which side of each obstacle, which layer) and draws its own geometry."""
+    x0, y0 = origin
+    layers = ("F.Cu", "B.Cu")
+    nets = {}
+    for i, net in enumerate(sim.nets):
+        yb, _, xb, _ = net.box
+        paths, vs = [], []
+        for path in trace(net):
+            run = [path[0]]
+            for a, b in zip(path[:-1], path[1:]):
+                if b[0] != a[0]:
+                    paths.append({"layer": layers[run[0][0]], "points": [[round(x0 + (c[2] + xb) * cell, 4), round(y0 + (c[1] + yb) * cell, 4)] for c in run]})
+                    vs.append([round(x0 + (b[2] + xb) * cell, 4), round(y0 + (b[1] + yb) * cell, 4)])
+                    run = [b]
+                else:
+                    run.append(b)
+            paths.append({"layer": layers[run[0][0]], "points": [[round(x0 + (c[2] + xb) * cell, 4), round(y0 + (c[1] + yb) * cell, 4)] for c in run]})
+        nets[names[i]] = {
+            "pads": len(board.nets[names[i]]), "routed": bool(not net.failed and net.p is not None), "skipped_pads": int(net.skipped),
+            "length_mm": round(float(length[i]) * cell, 3), "straight_mm": round(float(stretch[i] and length[i] * cell / stretch[i]), 3),
+            "stretch": round(float(stretch[i]), 3), "vias": round(float(vias[i]), 2), "contention": round(float(cont[i]), 4),
+            "tier": int(tiers[i]), "paths": paths, "via_points": vs,
+        }
+    doc = {"generator": "physarum_route.py", "board": str(Path(pcb).name), "units": "mm", "frame": "kicad (y down)",
+           "cell_mm": cell, "layers": list(layers), "nets": nets}
+    Path(out).write_text(json.dumps(doc, indent=1))
+    return len(nets), sum(len(n["paths"]) for n in nets.values())
+
+
 def write_pro(pcb, names, tiers, out):
     """Copy of the project file with topor_p1..3 net classes and, per routed net, a net class assignment
     (KiCad 9+: `netclass_assignments` maps a net to a list of classes; earlier topor_p* entries are replaced)."""
@@ -928,6 +961,7 @@ def main():
     ap.add_argument("--route-power", action="store_true")
     ap.add_argument("--write-pro", action="store_true")
     ap.add_argument("--write-pcb", action="store_true", help="copy of the board with the tubes as tracks and vias (opens in KiCad)")
+    ap.add_argument("--write-seed", action="store_true", help="<board>_physarum.seed.json: the tube polylines and scores per net, for a topological router")
     ap.add_argument("--keep-copper", action="store_true", help="with --write-pcb: keep the routed nets' existing tracks")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
@@ -1024,6 +1058,9 @@ def main():
             pass
         nseg, nvia = write_pcb(a.pcb, f"{stem}_physarum.kicad_pcb", sim, names, origin, a.cell, rules[1], via, rip=not a.keep_copper)
         print(f"wrote {stem}_physarum.kicad_pcb: {nseg} segments, {nvia} vias ({'kept' if a.keep_copper else 'replaced'} the routed nets' copper)")
+    if a.write_seed:
+        nn, npaths = write_seed(a.pcb, f"{stem}_physarum.seed.json", sim, names, origin, a.cell, board, length, vias, cont, stretch, tiers)
+        print(f"wrote {stem}_physarum.seed.json: {nn} nets, {npaths} polylines")
     if a.write_pro:
         write_pro(a.pcb, names, tiers, f"{stem}_physarum.kicad_pro")
         print(f"wrote {stem}_physarum.kicad_pro ({n1} nets topor_p1, {n2} topor_p2, {len(names) - n1 - n2} topor_p3)")
