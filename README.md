@@ -121,6 +121,7 @@ stated, min or median after a warm-up call, host wall clock from Python unless t
 | Convolution reverb, 65536 taps, 2048-sample blocks, stereo | 0.43 ms NPU per block per channel (43 ms of audio), 308 GMAC/s in the calls; 41x real time over the whole Python loop on a stereo file, bit-exact vs FFT (`fun/reverb.py`) |
 | Lenia 512x512, 27x27 kernel (729 taps/cell), int16 Q15 | 0.65-0.84 ms/step, 1200-1500 steps/s, ~250 GMAC/s, conv exact to 6 LSB (`fun/lenia.py`) |
 | DX7 FM synth, 512 voices x 6 operators, 256-sample blocks | 0.5 ms per block (5.3 ms of audio), 1.6 G operator-samples/s, bit-exact replica (`fun/dx7.py`) |
+| NAM guitar amp (WaveNet, 13320 MAC/sample), 64-sample blocks, 16 cores per amp | 0.54 ms per block (1.33 ms of audio) for two amps at once, 65.9 dB SNR vs the float32 model with bf16 hi+lo pairs, 48 dB with single bf16 weights; live at 1.3 ms blocks, no underruns (`fun/nam_amp.py`) |
 | Additive synth, 3072 partials, 1024-sample blocks | 0.38 ms per block (21 ms of audio: 56x real time for all 3072 partials) = 8 G partial-samples/s, amplitude drift-free, 0.03 Hz tuning (`fun/additive.py`) |
 | Binaural, 32 sources x 2 ears x 160 taps, 1024-sample blocks | 0.28 ms per block (dispatch-bound), bit-exact, 38x real time (`fun/binaural.py`) |
 | conv2d engine 512x512: K=3 / 7 / 15 | 0.27 / 0.35 / 0.91 ms per pass, 1-4 LSB vs numpy (`fun/conv2d.py`) |
@@ -168,6 +169,7 @@ Batch work per dispatch; keep one call per frame.
 | `fft.py` | the attempt at a batched FFT; kept as a design, its kernel does not compile on AIE2P/Peano (see the FFT section) |
 | `patterns.py` | RLE helper with the classic Life objects for `life_window.py` (no main) |
 | `dx7.py` | DX7-style FM synth: 512 six-operator voices, voices in the lanes, sine through the lookup unit, the 32 algorithms as data; `--window` plays it from the keyboard, bit-exact numpy replica, `dx7_demo.wav` |
+| `nam_amp.py` | Neural Amp Modeler guitar amps (`.nam` WaveNet captures) as a 16-core pipeline per amp, two amps at once; `--wav` renders a DI through amp and cab IR, `--live` is mic/line in to speakers at 1.3 ms blocks, `--selftest` / `--stages` compare with a float32 reference per core; see the section |
 | `probe/plasma.py` | 3-sine plasma, `--window` |
 | `physarum_route.py` | slime-mould router for KiCad boards (Tero's Physarum solver, every net a tube network competing for space); `--window` / `--video` show the tubes grow, `--write-pcb` writes the tubes as tracks and vias into a copy of the board (opens in KiCad), `--write-pro` writes topor priority net classes. CPU only (sparse direct solves), see the section |
 
@@ -180,6 +182,8 @@ Batch work per dispatch; keep one call per frame.
 | `burn.py`, `burn2.py`, `sustain.py`, `clock_under_load.py` | per-core compute ceiling (II-1 vector loop), kernel variants, implied clock, long vs short calls, clock under CPU load |
 | `plasma.py` | 1080p plasma on 32 cores, the frame-output template; `--window` |
 | `lut.py` | `aie::parallel_lookup` against a scalar gather loop (palettes, textures) |
+| `vtanh.py` | the AIE2P hardware tanh (`aie::tanh`, bf16 out) against numpy: it returns its argument unchanged for abs(x) <= 0.5 and is 4-20 bf16 ulps off elsewhere, which is why `nam_amp.py` uses a table instead |
+| `nam_torch_check.py` | the float32 NAM reference in `fun/nam_amp.py` against the official neural-amp-modeler torch code (run it yourself; the sandbox here does not execute downloaded packages) |
 | `fir_check.py`, `fir_floor.py`, `fir_alt.py`, `gs_check.py`, `ising_check.py` | static schedule (II, libcalls, stack) reports for the FIR, Gray-Scott and Ising kernels; where the reverb's time goes |
 | `lbm_check.py`, `lenia_dbg.py`, `lenia_dbg2.py`, `room_decay.py`, `room_rounding.py`, `slime_stats.py` | the debugging runs behind the lessons in this README (numpy emulations of rounding, mass and energy checks) |
 
@@ -386,6 +390,52 @@ oscillator at the end of its first turn); and the modulation depth: with the DX7
 modulator at level 80 under an envelope at 85 is -14 dB - 10 dB = 0.06 of full scale, so "full scale" must be
 large (6 turns = 38 rad of phase deviation here) or nothing bends. The numbers are tuned by spectral centroid,
 not by ear.
+
+## A guitar amp: Neural Amp Modeler's WaveNet, bf16 with limbs
+
+![nam](docs/img/nam_amp.png)
+
+`fun/nam_amp.py` runs a [Neural Amp Modeler](https://github.com/sdatkinson/neural-amp-modeler) capture: the
+"standard" `.nam` is a WaveNet of two layer arrays (16 then 8 channels) with ten dilated causal convolutions each
+(kernel 3, dilations 1..512), tanh, a 1x1 back into the residual stream, the activations summed into a head stream
+that the next array keeps adding to, and a final 1x1 and scale; 13320 multiply-adds per sample, a receptive field
+of 4093 samples. The arithmetic is nothing for this chip (0.64 GMAC/s at 48 kHz); the problem is state and
+precision. Every layer must keep 2*d samples of its input per channel: 96 KB of history for the whole net, which
+does not fit one core (64 KB), so one amp is a **pipeline of 16 cores** (four columns): time is in the lanes (64
+samples per block = one bf16 vector per channel), every weight is a scalar broadcast into a bf16 `aie::mac`, the
+residual and head streams travel between cores as fp32 payload, and layers too big for one core (d=256 and d=512)
+are split over cores by input channel with the partial accumulator as payload. A greedy planner packs the layers
+into cores from a memory model that was calibrated on the real placement (adjacent ObjectFifo buffers live on the
+producer tile; a column's first core also holds a DMA copy of its incoming payload). The host sends the weights
+along with every block (66 KB for two amps, nothing against the dispatch floor) and a reset/generation flag so the
+cores zero their histories after a pause.
+
+Precision was the real story. This net amplifies its operands by about 25 dB per layer (weights with sigma 2-3 over
+48 terms), so plain bf16 operands (8-bit mantissa) leave **19 dB** of SNR against the float32 model, and bf16 on the
+tanh input alone leaves 26 dB; the residual stream's "operating point" is small (|x| < 3 at silence), so centring
+did not help. The cure is the old double-double trick: every operand is split into a hi + lo bf16 pair (`hi =
+bf16(x)`, `lo = bf16(x - hi)`, two macs per term, fp32-exact) and the history is stored as such pairs (hence 96 KB
+twice over, hence 16 cores). Weights as pairs too (three macs per term, the default) give **65.9 dB** against the
+float32 model, which is where the 256-segment piecewise-linear tanh table tops out; single bf16 weights give 48 dB
+(a fixed perturbation of the model, smaller than a capture's own training error) at the same core count and 0.50
+instead of 0.54 ms per block. A numpy emulation of the kernel arithmetic sits at 88 dB from the NPU, so what is
+left is the arithmetic, not a bug. The hardware `aie::tanh` is not used: `probe/vtanh.py` shows it returns its
+argument unchanged for |x| <= 0.5 (3.7e-2 error, -28 dB) and is 4-20 bf16 ulps off elsewhere. The table does
+`offset + slope * (hi + lo)` with the index from `aie::to_fixed<int32>` on the bf16 hi part and two
+`parallel_lookup` fetches (float offsets, bf16 slopes), 1.2e-4 maximum error.
+
+Numbers: a 64-sample block of two amps takes 0.54 ms on the chip (1.33 ms of audio; one amp takes the same), the
+16-core chain is about 0.3 ms of that and the dispatch floor the rest; `--live` runs the laptop mic or line input
+through an amp and the cab IR (a 170 ms FIR on the CPU, `fftconvolve`) at 64-sample blocks with 0.58 ms per block
+and no underruns; `--wav` renders 16 s of guitar DI in 7 s. Supported are the classic two-array captures (tens of
+thousands exist on tone3000.com; the planner asserts on anything else, e.g. the newer "A2" and packed models). The
+demo wav is the NAM plugin's own MIT guitar DI through Steven Atkinson's "Obsidian" hi-gain capture and a Celestion
+V30 impulse response, neither model nor audio is in this repo (`--wav`, `--model`, `--ir` take paths).
+
+Two things that bit: a stage with many small layers overflowed the 16 KB *program* memory (unrolled per-layer code),
+fixed with one generic `layer()` over a descriptor table; and pass-through cores that pad a column to four must
+forward the partial-accumulator payload too, or be placed where none is in flight (the first version only worked
+by accident of buffer placement).
 
 ## Room acoustics -> impulse response -> reverb (a chain)
 
@@ -609,6 +659,13 @@ pad-to-pad distance and how much competition it meets along the way, binned into
   the Gordon-Smith "magic circle" oscillator, Visscher's scheme, Gray-Scott/Pearson, Onsager and
   Yang, Greenberg-Hastings and Griffeath's cyclic CA, Bak-Tang-Wiesenfeld, Quilez's SDF articles
   and Hart's sphere tracing, Karplus-Strong, LifeWiki's pattern catalogue.
+* Neural Amp Modeler is Steven Atkinson's (MIT): the `.nam` format and the WaveNet it describes were read from
+  the `neural-amp-modeler` python package and `NeuralAmpModelerCore`; `fun/nam_amp.py` contains no code from them.
+  The "Obsidian" capture (`REAPER/model.nam`) and the guitar DI (`REAPER/Guitar DI.wav`) used for the demo are from
+  the [NeuralAmpModelerPlugin](https://github.com/sdatkinson/NeuralAmpModelerPlugin) repo (MIT), the BOSS SD-1
+  capture from Mike Oliphant's [NeuralAudio](https://github.com/mikeoliphant/NeuralAudio) (MIT), the Celestion V30
+  impulse response from [AIDA-X](https://github.com/AidaDSP/AIDA-X) (GPL-3.0); none of these files, nor the
+  community captures from pelennor2170/NAM_models (GPL-3.0) used in testing, are redistributed here.
 * The drum loop used for the reverb and resynthesis demos is not included; use any 48 kHz wav.
 
 ## Gotchas
@@ -640,6 +697,30 @@ scripts still expect to run from this directory: `probe/*.py` do `sys.path.inser
 
 `-I` drops `PYTHONPATH`, so `pyxrt` (shipped with XRT, not pip) disappears:
 `Unsupported device: npu (CPUOnlyTensor is in use: pyxrt is not importable)`.
+
+### bf16 operands lose when the net amplifies
+
+A bf16 value carries 8 mantissa bits. A WaveNet layer sums 48 weighted operands with weights of sigma 2-3, so the
+operand rounding comes out 25 dB louder per layer and the amp model ends at 19 dB SNR. Split every operand into a
+hi + lo bf16 pair (`hi = acc.to_vector<bf>(); lo = aie::sub(acc, A(hi)).to_vector<bf>()`) and mac both: fp32-exact
+operands at two macs per term, no fp32 multiply needed (which AIE2P does not have natively). `fun/nam_amp.py`.
+
+### `aie::tanh` is a rough approximation
+
+The hardware tanh (bf16 out) returns its argument unchanged for |x| <= 0.5 and is 4-20 bf16 ulps off elsewhere
+(`probe/vtanh.py`). Fine for a neural net's hidden layer, not for audio. A piecewise-linear table through
+`parallel_lookup` (offset + slope * x, 256 segments) is 1.2e-4 accurate.
+
+### Program memory is 16 KB per core
+
+Code counts too: a core with seven unrolled layers failed to link ("section '.text' will not fit in region
+'program'"). Put per-instance differences in a descriptor table and keep one function.
+
+### ObjectFifo buffers live on the producer
+
+Between adjacent cores an ObjectFifo's buffer is allocated once, on the producer tile; the consumer reads it over
+the neighbour window. Across columns (DMA) both sides hold a copy. Plan memory accordingly (`input_with_addresses.mlir`
+in the cache directory lists every buffer with its tile).
 
 ### Static schedule check before hardware
 
