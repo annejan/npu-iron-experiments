@@ -130,6 +130,16 @@ Benchmark trap: the first call of a design loads (or compiles) it and costs 0.4-
 after a warm-up call, or the throughput number is garbage (the first version of this bench
 reported 16 GMAC/s for that reason).
 
+## FFT: not in aie_api on this toolchain
+
+`aie::fft_dit_r4_stage` and friends compile only for AIE1; AIE2P has the class form, but
+`detail/aie2p/fft_dit.hpp` sits behind `__AIE_API_COMPLEX_VECTOR_SUPPORT__`, which
+`detail/config.hpp` sets to 0 whenever `__AIECC__` (Peano) is defined. No `cint16` vectors, no
+FFT (`fun/fft.py` is the attempt; it fails at compile time). Options: a hand-written radix-2/4
+on separate int16 re/im vectors, or a DFT as an int16 matmul (W is 2048x2048 for 1024 complex
+points; batches of frames make it a wide GEMM, which this chip likes, but the acc32 sum of 2048
+Q15 products needs the output shift the stock kernel does not expose).
+
 ## Dense matmul: how much of the 50 TOPS the stock example gets
 
 `mlir-aie/programming_examples/basic/matrix_multiplication/whole_array/whole_array.py`, 8 columns,
