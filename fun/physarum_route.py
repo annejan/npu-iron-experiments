@@ -321,7 +321,9 @@ class Net:
         self.last_step, self.rotate = step, rotate
         D = self.D * self.active
         if kappa > 0 and step > 0:
-            D = D * np.exp(-kappa * self.yield_ * np.maximum(others, 0) * ~self.exit).astype(np.float32)
+            # crowding damps the tubes, but never below 1e-3 of their thickness: a terminal whose only way out
+            # crosses a crowd must stay numerically connected (exp(-40) made the matrix singular: nets gave up)
+            D = D * np.maximum(np.exp(-kappa * self.yield_ * np.maximum(others, 0) * ~self.exit), 1e-3).astype(np.float32)
             if self.hard and crowd is not None:
                 D = D * ((crowd < 0.5) | self.exit)              # regrown after rip-up: other tubes are walls
             D[self.own] = self.dmax
