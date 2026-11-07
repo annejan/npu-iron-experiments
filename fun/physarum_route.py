@@ -30,6 +30,7 @@ from pathlib import Path
 import numpy as np
 
 POWER = re.compile(r"^(\+|-)?\d|^(V|VCC|VDD|VBAT|GND|AGND|PWR)", re.I)
+DUMP = ""                    # --dump-failed DIR: save a failed net's arrays for a post-mortem
 
 # ----------------------------------------------------------------------------------------------- KiCad file
 _TOK = re.compile(r'"(?:[^"\\]|\\.)*"|\(|\)|[^\s()]+')
@@ -410,6 +411,10 @@ class Net:
                     return
             if self.resets >= 3:
                 self.failed = True
+                if DUMP:
+                    np.savez_compressed(f"{DUMP}/net{self.n}.npz", free=self.free, active=self.active, own=self.own, exit=self.exit,
+                                        D=self.D, s=s, sink=sink, Deff=D, groups_l=np.array([g[0] for g in self.groups]),
+                                        box=np.array(self.box), others=others, why=np.array(self.why))
             return
         self.q = q
         self.p, self.E = p, (Dx, Dy, Dse, Dsw, Dz)
@@ -420,7 +425,11 @@ class Net:
             Dn /= m
         Dn[self.own] = self.dmax
         Dn[~self.active] = 0
-        dead = self.active & ~self.own & (Dn < self.prune)
+        # prune by flow, not by thickness: a far terminal's flow starts spread over many cells, each carrying
+        # too little to keep its tube above a thickness floor, and all of them died in one step (the pad was
+        # cut off before the feedback could gather its flow); a cell dies only when it carries less than
+        # `prune` of one terminal's flow
+        dead = self.active & ~self.own & (q < self.prune / max(1, len(self.groups) - 1))
         self.active &= ~dead
         Dn[~self.active] = 0
         np.clip(Dn, 0, self.dmax, out=Dn)
@@ -429,7 +438,7 @@ class Net:
 
 class Physarum:
     def __init__(self, owner, net_pads, *, via_cost=4.0, cell=0.5, pitch=0.35, kappa=2.0, dt=0.7, mu=1.5,
-                 dmin=0.0, dmax=4.0, prune=1e-3, margin=0.3, seed=0, rotate=20, sweeps=0, norm=False, ringof=None,
+                 dmin=0.0, dmax=4.0, prune=1e-2, margin=0.3, seed=0, rotate=20, sweeps=0, norm=False, ringof=None,
                  crowd=1.0, walls=False):
         self.owner = owner; L, H, W = owner.shape; self.N = len(net_pads)
         self.cell, self.kappa, self.rotate, self.walls = cell, kappa, rotate, walls
@@ -946,7 +955,7 @@ def main():
     ap.add_argument("--pitch", type=float, default=0.0, help="track + clearance, mm: capacity per cell; default from the project")
     ap.add_argument("--steps", type=int, default=40, help="steps per round (tubes settle in ~25)")
     ap.add_argument("--rounds", type=int, default=4, help="rip-up rounds: the most contested nets regrow with the others as walls")
-    ap.add_argument("--prune", type=float, default=1e-3, help="drop cells whose tube got thinner than this")
+    ap.add_argument("--prune", type=float, default=1e-2, help="drop cells carrying less than this fraction of one terminal's flow")
     ap.add_argument("--dt", type=float, default=0.7, help="tube adaptation per step (explicit Euler, < 1)")
     ap.add_argument("--window", action="store_true", help="watch the tubes grow (pygame)")
     ap.add_argument("--video", default="", help="write the growth as an mp4 (ffmpeg) and a gif")
@@ -966,8 +975,12 @@ def main():
     ap.add_argument("--write-seed", action="store_true", help="<board>_physarum.seed.json: the tube polylines and scores per net, for a topological router")
     ap.add_argument("--keep-copper", action="store_true", help="with --write-pcb: keep the routed nets' existing tracks")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--dump-failed", default="", help="directory: save the arrays of every net that gives up")
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
+    global DUMP
+    if a.dump_failed:
+        DUMP = a.dump_failed; Path(DUMP).mkdir(parents=True, exist_ok=True)
     if a.selftest:
         sys.exit(0 if selftest(max(a.steps, 100), 0, a.mu) else 1)
     board = Board(a.pcb)
