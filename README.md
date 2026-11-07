@@ -48,6 +48,7 @@ mlir-aie 1.4.5 (IRON) with XRT 2.26 unpacked in `../ryzenai`. `./setup.sh` once,
 | Ripple tank 320x384, int16 Q12, world on chip, 5 steps/dispatch | 17k steps/s, 2.1 Gcell-steps/s (`fun/water.py`) |
 | Convolution reverb, 65536 taps, 2048-sample blocks, stereo | 0.43 ms per block per channel, 308 GMAC/s, 41x real time, bit-exact vs FFT (`fun/reverb.py`) |
 | Lenia 512x512, 27x27 kernel (729 taps/cell), int16 Q15 | 0.65-0.84 ms/step, 1200-1500 steps/s, ~250 GMAC/s, conv exact to 6 LSB (`fun/lenia.py`) |
+| Additive synth, 3072 partials, 1024-sample blocks | 0.38 ms per block = 8 G partial-samples/s (~8000x real time), amplitude drift-free, 0.03 Hz tuning (`fun/additive.py`) |
 | Binaural, 32 sources x 2 ears x 160 taps, 1024-sample blocks | 0.28 ms per block (dispatch-bound), bit-exact, 38x real time (`fun/binaural.py`) |
 | conv2d engine 512x512: K=3 / 7 / 15 | 0.27 / 0.35 / 0.91 ms per pass, 1-4 LSB vs numpy (`fun/conv2d.py`) |
 | Physarum 120k agents + NPU blur | 13.8 ms/step total, NPU 0.7 ms of it (the agents are the cost) (`fun/physarum.py`) |
@@ -87,6 +88,7 @@ Batch work per dispatch; keep one call per frame.
 | `sandpile.py` | Abelian sandpile, exact int16 stencil on chip, 2^18 grains dropped in portions (abelian), the fractal in `sandpile.png` |
 | `grayscott.py` | Gray-Scott reaction-diffusion, int16 Q14, world on chip; `--F --k` or live keys through Pearson's map |
 | `water_resident.py` | the ripple tank with its world resident in L1 across dispatches (`Buffer` + `while_true` workers, one command object per call); measures the DDR saving and the autosuspend reset |
+| `additive.py` | additive synthesiser: 3072 partials as magic-circle oscillators, 32 samples of each sinusoid in the lanes, one rotation per sub-block, no trig; bells and STFT resynthesis to wav, bit-exact numpy replica |
 | `lbm.py` | Lattice-Boltzmann D2Q9 fluid, flow past a cylinder; world in DDR, streamed through all 32 cores every step, shim DMA gathers the halo rows with a 3-D pattern, cores use a 3-row sliding window (`acquire(3)`); `--window` (drag = obstacles, C = clear) |
 | `../probe/plasma.py` | 3-sine plasma, `--window` |
 
@@ -252,6 +254,20 @@ mirrored for the left half, interaural delay included), runs two FIRs and return
 partials the host sums. The demo is 32 plucked notes around a pentatonic ladder, triggered in
 turn around a slowly turning ring: listen with headphones. The arithmetic is small (37 GMAC/s),
 so this one is bound by the 160 us dispatch; it would be the same at 300 sources.
+
+## Oscillators without trigonometry: time in the lanes
+
+`fun/additive.py`: a partial is a 32-lane int16 vector pair holding 32 consecutive samples of its
+sinusoid (u) and the Gordon-Smith companion (v). One sub-block of 32 samples later the whole vector
+has rotated by theta = 32 w, the same constant in every lane: u' = u + e v, v' = v - e u', e = 2
+sin(theta/2) in Q13. That update has determinant 1 for any quantised e, so the amplitude cannot
+drift (measured: identical first and last second over 10 s); only the host computes a sine, once,
+to seed the lanes. 96 partials per core, 32 cores: 3072 partials, per 1024-sample block 32
+rotations and one amplitude-ramped multiply-accumulate each, 0.38 ms. Two subtleties: cos is even,
+so e alone does not tell theta from 2 pi - theta (seed the lanes on the branch of theta mod 2 pi),
+and Q15 cannot hold 1.0, so "no decay" must skip the multiply (32767/32768 per sub-block is -3% in
+10 s). Demos: bells (inharmonic partial sets with per-partial decay) and a drum loop resynthesised
+from its STFT magnitudes with one partial per bin.
 
 ## Room acoustics -> impulse response -> reverb (a chain)
 
