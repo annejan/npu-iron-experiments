@@ -260,7 +260,7 @@ class Net:
         if ringof is not None:
             self.exit |= ringof[:, y0:y1, x0:x1] == n            # a pad's clearance ring: free for its own net, and
             self.free |= self.exit                               # no crowding penalty there (pins sit close by design)
-        self.failed = False; self.hard = False
+        self.failed = False; self.hard = False; self.skipped = 0
         self.yield_ = float(rng.uniform(0.5, 1.5))                 # how much this net gives way in a crowd
         self.own = own
         self.active = self.free.copy()
@@ -273,6 +273,14 @@ class Net:
         # pad cell groups in ROI coordinates
         self.groups = [(l, ys - y0, xs - x0) for l, ys, xs in pads]
         self.sink_i = 0
+
+    def unreachable(self):
+        """Indices of terminal groups not connected to group 0 through free cells (8 neighbours + the via)."""
+        from scipy.ndimage import label
+        lab, _ = label(self.free, structure=np.ones((3, 3, 3), int))
+        l, ys, xs = self.groups[0]
+        root = lab[l, ys[0], xs[0]]
+        return {gi for gi, (l, ys, xs) in enumerate(self.groups) if lab[l, ys[0], xs[0]] != root}
 
     def exits(self, l, ys, xs):
         """Does this terminal touch any free non-pad cell (8 neighbours on its layer, or the other layer)?"""
@@ -382,6 +390,13 @@ class Net:
             # a net that cannot connect even on the full region is given up (walled-in pads)
             self.active = self.free.copy(); self.D[self.free] = 1.0; self.D[self.own] = self.dmax; self.resets += 1
             self.q[:] = 0; self.length = self.vias = 0.0
+            if self.resets >= 2 and len(self.groups) > 2:
+                # drop the terminals that cannot be reached from the sink at all (enclosed pads) and route the rest
+                lost = self.unreachable()
+                if lost and len(self.groups) - len(lost) >= 2:
+                    self.groups = [g for gi, g in enumerate(self.groups) if gi not in lost]
+                    self.skipped += len(lost); self.resets = 0
+                    return
             if self.resets >= 3:
                 self.failed = True
             return
@@ -935,6 +950,9 @@ def main():
         if stop:
             break
     length, vias, cont = sim.report()
+    part = [(names[i], n.skipped) for i, n in enumerate(sim.nets) if n.skipped and not n.failed]
+    if part:
+        print(f"{len(part)} nets routed without their enclosed pads: {[f'{n} (-{k})' for n, k in part[:8]]}{' ...' if len(part) > 8 else ''}")
     bad = [(names[i], n.why) for i, n in enumerate(sim.nets) if n.failed]
     if bad:
         print(f"{len(bad)} nets gave up:")
