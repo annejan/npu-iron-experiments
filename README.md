@@ -86,6 +86,7 @@ Batch work per dispatch; keep one call per frame.
 | `schrodinger.py` | 2-D Schrodinger equation, Visscher scheme, int32 Q28, 5-row sliding window; a wave packet through a double slit; `--check` vs numpy |
 | `sandpile.py` | Abelian sandpile, exact int16 stencil on chip, 2^18 grains dropped in portions (abelian), the fractal in `sandpile.png` |
 | `grayscott.py` | Gray-Scott reaction-diffusion, int16 Q14, world on chip; `--F --k` or live keys through Pearson's map |
+| `water_resident.py` | the ripple tank with its world resident in L1 across dispatches (`Buffer` + `while_true` workers, one command object per call); measures the DDR saving and the autosuspend reset |
 | `lbm.py` | Lattice-Boltzmann D2Q9 fluid, flow past a cylinder; world in DDR, streamed through all 32 cores every step, shim DMA gathers the halo rows with a 3-D pattern, cores use a 3-row sliding window (`acquire(3)`); `--window` (drag = obstacles, C = clear) |
 | `../probe/plasma.py` | 3-sine plasma, `--window` |
 
@@ -179,6 +180,20 @@ picture each:
 * Keep the int32 accumulator in range: sum(k) = 1 scaled by 2^16 times 32767 just fits; 2^19
   overflowed. And subtract in int16 before converting to bf16 when the next step is a sharp
   Gaussian (sigma 0.015): bf16(u) alone has 8 mantissa bits.
+
+## State resident on the chip across dispatches
+
+`fun/water_resident.py`: each worker keeps its two band buffers as `Buffer`s in L1 and runs its
+default `while_true` loop, one iteration per dispatch, gated by acquiring a 32-int command object
+from a broadcast ObjectFifo (drop x, y, amplitude); it then runs an even number of steps and
+pushes only its h rows out. It works: the world carries over from call to call (same energy as
+`water.py` after 80 steps, small rounding-level differences, rms 7 LSB). But at this size it
+buys nothing: 0.221 ms per call against 0.230 ms with the whole world through DDR, because the
+1 MB round trip is ~10 us next to the ~160 us dispatch floor. Resident state only pays for worlds
+of many MB. And the catch: **after 5 s idle amdxdna suspends the device and the cores come back
+reset** (measured: energy 0.357 -> 0.000 after a 6.5 s pause), so a resident design needs a
+keep-alive call every few seconds or must re-upload after a pause (`llama_3_2_1b/README.md` says
+the same; `/sys/class/accel/accel0/device/power/autosuspend_delay_ms` is the knob, root only).
 
 ## The lookup unit: gathers after all (for tables)
 
