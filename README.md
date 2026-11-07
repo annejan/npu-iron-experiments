@@ -38,6 +38,7 @@ mlir-aie 1.4.5 (IRON) with XRT 2.26 unpacked in `../ryzenai`. `./setup.sh` once,
 | Ripple tank 320x384, int16 Q12, world on chip, 5 steps/dispatch | 17k steps/s, 2.1 Gcell-steps/s (`fun/water.py`) |
 | Convolution reverb, 65536 taps, 2048-sample blocks, stereo | 0.43 ms per block per channel, 308 GMAC/s, 41x real time, bit-exact vs FFT (`fun/reverb.py`) |
 | Lenia 512x512, 27x27 kernel (729 taps/cell), int16 Q15 | 0.65-0.84 ms/step, 1200-1500 steps/s, ~250 GMAC/s, conv exact to 6 LSB (`fun/lenia.py`) |
+| 3-D wave FDTD 32x32x128 (131k cells), int32, 1 step/dispatch | 0.21 ms/step NPU, 0.26-0.31 ms incl. host readback: 1 s of 8 kHz room response in 2.5 s (`fun/room.py`) |
 | LBM D2Q9 384x256, bf16 deviations, 1 step per dispatch (DMA-bound) | 2700 steps/s, 0.27 Gcell-steps/s (`fun/lbm.py`) |
 | Mandelbrot 1080p, 400 iterations, Q24 int32, 16 lanes, 32 cores | 26.9 ms (numpy 5.4 s; old scalar int64 kernel on 8 cores 34x slower) (`fun/mandel.py --bench`) |
 
@@ -58,6 +59,7 @@ Batch work per dispatch; keep one call per frame.
 | `water.py` | ripple tank, int16 Q12 height field, on-chip world, `--window` (drag = drops, R = rain) |
 | `reverb.py` | convolution reverb: 65536-tap IR (1.4 s), 2048 taps per core, int16 Q15, `sliding_mac` FIR; `in.wav` offline with numpy check, `--play` live through the speakers (sounddevice) |
 | `lenia.py` | Lenia continuous CA: 27x27 ring-kernel convolution per step via `sliding_mac`, DDR world streamed through the cores with a 27-row ring buffer in L1, bf16 growth; `--window` |
+| `room.py` | 3-D FDTD room acoustics (32x32x128 cells, int32 Q28, 8 kHz), streams z-planes through the cores, records a stereo impulse response; `--check` vs numpy |
 | `lbm.py` | Lattice-Boltzmann D2Q9 fluid, flow past a cylinder; world in DDR, streamed through all 32 cores every step, shim DMA gathers the halo rows with a 3-D pattern, cores use a 3-row sliding window (`acquire(3)`); `--window` (drag = obstacles, C = clear) |
 | `../probe/plasma.py` | 3-sine plasma, `--window` |
 
@@ -151,6 +153,29 @@ picture each:
 * Keep the int32 accumulator in range: sum(k) = 1 scaled by 2^16 times 32767 just fits; 2^19
   overflowed. And subtract in int16 before converting to bf16 when the next step is a sharp
   Gaussian (sigma 0.015): bf16(u) alone has 8 mantissa bits.
+
+## Room acoustics -> impulse response -> reverb (a chain)
+
+`fun/room.py` simulates a 2.7 x 2.7 x 11 m hard-walled corridor with the 3-D wave equation (7-point
+stencil, leapfrog, lambda = c dt/dx = 0.5, dx 8.6 cm at 8 kHz), injects a pulse and records two
+"ears" 8 m away for one second; `room_ir_48k.wav` is that impulse response resampled, and
+
+```
+./env.sh python fun/room.py
+./env.sh python fun/reverb.py <drums.wav> --ir room_ir_48k.wav --wet 0.5
+```
+
+plays the drum loop in the simulated corridor (`amen_in_the_simulated_corridor.wav`; RT60 about
+1.7 s, -30 dB after 0.85 s). 8000 steps take 2.5 s; the NPU dispatch is 0.21 ms of the 0.31 ms
+loop, the rest is reading the field back to pick two samples.
+
+Lesson: **int16 is not enough for a second-order wave update.** In int16 Q14 the field died
+within 100 ms (energy -30 dB at 70 ms); a numpy emulation with exact round-to-nearest did the
+same, truncation killed it faster, floor made it grow. The Laplacian term of a wave at tens of
+LSB rounds to nothing. int32 Q28 (`aie::mul(int32 vector, int16 scalar)` into `acc64`, 16
+lanes) matches the float reference's energy to 2% over 1500 steps. Rule: integrators and wave
+equations want 24+ fraction bits; use int32, or bf16 only for quantities that are re-derived
+every step (LBM's distributions, Lenia's world).
 
 ## FFT: not in aie_api on this toolchain
 

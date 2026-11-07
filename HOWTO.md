@@ -47,9 +47,11 @@ in unattended runs: write PNG (cv2.imwrite) or WAV (soundfile) outputs instead.
 8. **Not native, avoid in hot loops:** float vector multiply, scalar float mul/div, int divide,
    64-bit multiply, `aie::neg` on bf16 (multiply by -1), `aie::shift_bytes` (use
    `shuffle_down_fill`), cint16/complex vectors, per-lane gather.
-9. **bf16 integrates badly** (8 mantissa bits): small increments into large values vanish. Height
-   fields, counters, accumulations over many steps: int16/int32 fixed point. Store deviations from
-   a rest value when you must use bf16 (LBM).
+9. **bf16 integrates badly** (8 mantissa bits), and so does int16 for second-order updates: the
+   ripple tank needed int16 Q12, the 3-D wave equation needed int32 Q28 (int16 Q14 lost its energy
+   in 100 ms; a numpy emulation with exact rounding proved it was the format). Counters, height
+   fields, wave equations: int32 fixed point. Store deviations from a rest value when you must use
+   bf16 (LBM).
 10. **Deliver:** the script in `fun/` with a docstring (what, how, how to run), a row in the
    README measured table, a short README section with the lessons, output files (`*.png`,
    `*.wav`, gitignored), and a commit (`Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`
