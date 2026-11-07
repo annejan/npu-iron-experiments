@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """2-D Schrodinger equation on the NPU: a wave packet through a double slit (Visscher's staggered scheme).
 
-  ../env.sh python fun/schrodinger.py                 run, write schrodinger.png (|psi|^2 and the screen)
-  ../env.sh python fun/schrodinger.py --check         30 steps against a numpy float64 reference
-  ../env.sh python fun/schrodinger.py --window        pygame
+  ./env.sh python fun/schrodinger.py                 run, write schrodinger.png (|psi|^2 and the screen)
+  ./env.sh python fun/schrodinger.py --check         30 steps against a numpy float64 reference
+  ./env.sh python fun/schrodinger.py --window        pygame
 
 psi = R + i I on a 512x512 grid (hbar = m = dx = 1), H psi = -1/2 lap(psi) + V psi, V a wall with two slits.
 Visscher: R(t+dt) = R + dt H I(t+dt/2); I(t+3dt/2) = I(t+dt/2) - dt H R(t+dt). Both fields and V are int32 (R, I
 in Q28; V in Q20) streamed through the chip like lbm.py with a 5-row sliding window: a core computes the new R for
 rows y-1, y, y+1 from the I window, then the new I for row y from those, so one dispatch is one full step.
 dt = 0.1 (stable for dt < 0.5 at dx = 1 without potential). The screen (a column behind the slits) accumulates |psi|^2.
+
+Scheme: P. B. Visscher, "A fast explicit algorithm for the time-dependent Schrodinger equation", Computers in Physics
+5:596-598, 1991.
 """
 import argparse, sys, time
 import numpy as np

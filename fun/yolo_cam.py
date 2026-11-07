@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """YOLO26n object detection on the NPU from the webcam (or an image file), using the stock mlir-aie example.
 
-  ../env.sh python fun/yolo_cam.py --image some.jpg        one image -> yolo_cam.png with boxes
-  ../env.sh python fun/yolo_cam.py --still                 one webcam frame -> yolo_cam.png
-  ../env.sh python fun/yolo_cam.py --window                live pygame window (ESC)
+  ./env.sh python fun/yolo_cam.py --image some.jpg        one image -> yolo_cam.png with boxes
+  ./env.sh python fun/yolo_cam.py --still                 one webcam frame -> yolo_cam.png
+  ./env.sh python fun/yolo_cam.py --window                live pygame window (ESC)
   ... --synthetic 7                                        seeded random weights (no checkpoint; boxes are noise)
 
 Needs the exported, quantized weights: see mlir-aie/programming_examples/ml/yolo26n/README.md (`make export`,
 `make data` with IRON_EXAMPLE_WEIGHTS_DIR set). The whole network (168 int8 operators, 30 workers + 2 value
 tiles, every one of the 32 tiles) runs in one dispatch from a letterboxed 640x640 RGB image to (300, 6)
 detections (x1, y1, x2, y2, score, class). This script only adds the camera, the letterbox and the drawing.
+
+The Detector class is adapted from mlir-aie programming_examples/ml/yolo26n/yolo26n.py (main),
+Copyright (C) 2026 Advanced Micro Devices, Inc., SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+(LICENSES/Apache-2.0-WITH-LLVM-exception.txt); modified. The rest of this file: MIT, see LICENSE. No ultralytics
+code is used here: the letterbox is written from the description, the class names are COCO 2017's (Lin et al. 2014).
+The checkpoint (AGPL-3.0) and the quantized parameters derived from it are never part of this repository.
 """
 import argparse, hashlib, os, sys, time
 from pathlib import Path
@@ -24,6 +30,7 @@ import yolo26n as Y
 from yolo_params import DATA_DIR, Params, synthetic_params
 from yolo_spec import IMAGE_SIZE, MAX_DETECTIONS, Network
 
+# COCO 2017 category names (Lin et al. 2014), hyphenated
 COCO = ("person bicycle car motorcycle airplane bus train truck boat traffic-light fire-hydrant stop-sign parking-meter bench "
         "bird cat dog horse sheep cow elephant bear zebra giraffe backpack umbrella handbag tie suitcase frisbee skis snowboard "
         "sports-ball kite baseball-bat baseball-glove skateboard surfboard tennis-racket bottle wine-glass cup fork knife spoon "
@@ -33,7 +40,8 @@ COCO = ("person bicycle car motorcycle airplane bus train truck boat traffic-lig
 
 
 def letterbox_array(bgr, size=IMAGE_SIZE, pad=114):
-    """Ultralytics LetterBox on an in-memory BGR frame -> (RGB uint8 square, (ratio, left, top))"""
+    """Same geometry as Ultralytics' LetterBox (scale to fit, grey 114 pad, centred), written from the description, not copied.
+    BGR frame -> (RGB uint8 square, (ratio, left, top))"""
     import cv2
     h, w = bgr.shape[:2]
     r = min(size / h, size / w)

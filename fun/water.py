@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Ripple tank on the chip: height-field water, 32 AIE cores in a snake, halos over shared memory.
 
-  ../env.sh python fun/water.py              bench, write water.png
-  ../env.sh python fun/water.py --window     pygame: click/drag = drops, R = rain, ESC
+  ./env.sh python fun/water.py              bench, write water.png
+  ./env.sh python fun/water.py --window     pygame: click/drag = drops, R = rain, ESC
 
 Per cell h (height) and v (velocity), int16 Q12 (bf16 cannot integrate small v into h):
   v' = damp * (v + c2 * (h_l + h_r + h_u + h_d - 4 h))

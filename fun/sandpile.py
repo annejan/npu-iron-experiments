@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Abelian sandpile on the chip: drop 2^19 grains on the centre cell and let it topple into the fractal.
+"""Abelian sandpile on the chip: drop 2^18 grains on the centre cell and let it topple into the fractal.
 
-  ../env.sh python fun/sandpile.py [--grains 524288]     stabilise, write sandpile.png
-  ../env.sh python fun/sandpile.py --window
+  ./env.sh python fun/sandpile.py [--grains 262144]     stabilise, write sandpile.png
+  ./env.sh python fun/sandpile.py --window
 
 Bak-Tang-Wiesenfeld: a cell with >= 4 grains gives one to each of its 4 neighbours. Synchronous multi-toppling
 (c -> c & 3 + sum of neighbours' c >> 2) reaches the same stable pile as any sequential order (the model is
 abelian), and so does feeding the grains in portions: the centre gets at most 24000 grains per call so int16
 holds them. World 512x512 int16 on the 32 cores (slime.py layout), STEPS rounds per dispatch; the host stops when
 no cell has 4 or more grains. Exact integers: the check is grain conservation and max(cell) < 4.
+
+P. Bak, C. Tang and K. Wiesenfeld, "Self-organized criticality", Phys. Rev. Lett. 59:381, 1987.
 """
 import argparse, sys, time
 import numpy as np
@@ -157,7 +159,7 @@ class Sandpile:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--grains", type=int, default=1 << 19)
+    ap.add_argument("--grains", type=int, default=1 << 18)
     ap.add_argument("--window", action="store_true")
     a = ap.parse_args()
     sim = Sandpile()

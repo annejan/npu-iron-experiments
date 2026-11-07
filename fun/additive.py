@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Additive synthesis on the NPU: 3072 sinusoidal partials (96 per core) as magic-circle oscillators, time in the lanes.
 
-  ../env.sh python fun/additive.py            check vs a numpy replica, write additive_bells.wav and additive_resynth.wav
+  ./env.sh python fun/additive.py [drumloop.wav]    check vs a numpy replica, write additive_bells.wav and (from a 48 kHz
+                                                    drum loop, any wav you have) additive_resynth.wav
 
 One partial keeps 32 consecutive samples of its sinusoid in a 32-lane int16 vector pair (u = cos lanes, v = the
 Gordon-Smith companion). Advancing all 32 lanes by one sub-block of 32 samples is one rotation by theta = 32 w with the
@@ -10,6 +11,9 @@ quantised e, so the amplitude cannot drift. Per 1024-sample block a core rotates
 accumulates amplitude-ramped partials into the audio; the state (u, v) round-trips through DDR with the block.
 No sin/cos on the chip, no tables: the host sets the initial lanes once. Demo 1: bells (inharmonic partial sets,
 per-partial exponential decay). Demo 2: resynthesis of a drum loop from its STFT magnitudes (2048 partials, one per bin).
+
+Oscillator: J. W. Gordon and J. O. Smith, "A sine generation algorithm for VLSI applications", ICMC 1985; the "magic
+circle" name follows J. O. Smith, Physical Audio Signal Processing (ccrma.stanford.edu/~jos/pasp/Digital_Sinusoid_Generators.html).
 """
 import argparse, sys, time
 import numpy as np
@@ -228,7 +232,8 @@ def main():
     sf.write("additive_bells.wav", out.astype(np.float32), FS)
     # --- demo 2: resynthesis of a drum loop from STFT magnitudes: partial i = bin i of a 4096-point STFT, hop 1024
     try:
-        x, fs = sf.read("drumloop.wav", dtype="float64", always_2d=True)
+        loop = sys.argv[1] if len(sys.argv) > 1 else "drumloop.wav"
+        x, fs = sf.read(loop, dtype="float64", always_2d=True)
         x = x.mean(1); assert fs == FS
     except Exception as e:
         print("no drum loop for the resynthesis demo:", e); return

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Mandelbrot on the NPU: all 32 AIE cores, 16 pixels per vector, live zoom in the terminal.
 
-  ../env.sh python mandel.py                 zoom into Seahorse Valley
-  ../env.sh python mandel.py --still         one frame, then exit
-  ../env.sh python mandel.py --png out.png   one big frame as a PNG (no PIL needed)
-  ../env.sh python mandel.py --bench         scalar kernel vs 16-lane vector kernel vs numpy, 1920x1080
+  ./env.sh python fun/mandel.py                 zoom into Seahorse Valley
+  ./env.sh python fun/mandel.py --still         one frame, then exit
+  ./env.sh python fun/mandel.py --png out.png   one big frame as a PNG (no PIL needed)
+  ./env.sh python fun/mandel.py --bench         scalar kernel vs 16-lane vector kernel vs numpy, 1920x1080
 
 The host computes c for each pixel (fixed point, Q24 in an int32), the NPU runs the
 iterations and gives back the count per pixel. The coordinates are data, not compile-time

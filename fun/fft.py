@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """1024-point complex FFTs on all 32 AIE cores with the aie_api radix-4 DIT stages.
 
-  ../env.sh python fun/fft.py            check against numpy, measure FFTs per second
-  ../env.sh python fun/fft.py --check    static compile report only
+  ./env.sh python fun/fft.py            check against numpy, measure FFTs per second
+  ./env.sh python fun/fft.py --check    static compile report only
 
 cint16 (int16 re, im) in Q15, twiddles cint16 Q15 (shift_tw 15). Each radix-4 stage shifts by 17: 15 for the
 twiddle scaling and 2 so the stage gain of 4 never overflows; the output is fft(x)/1024. Five stages:
@@ -118,7 +118,7 @@ def fft_npu(x: In, tw: In, y: Out, *, cols: CompileTime[int], variant: CompileTi
 
 def check():
     from aie.utils.compile import remarks
-    d = Path(".remarks/rem_fft"); d.mkdir(parents=True, exist_ok=True)
+    d = Path(__file__).resolve().parent.parent / ".remarks" / ("rem_fft"); d.mkdir(parents=True, exist_ok=True)
     rep, why = remarks.analyze(ext(), "aie2p", d)
     if rep is None:
         print(why); sys.exit(1)

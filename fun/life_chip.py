@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Game of Life that stays on the chip: 32 AIE cores in a snake, halos over shared memory.
 
-  ../env.sh python life_chip.py                      live in the terminal, 1 generation per frame
-  ../env.sh python life_chip.py --bench --gens 1001  1001 generations per NPU call, race numpy
+  ./env.sh python fun/life_chip.py                      live in the terminal, 1 generation per frame
+  ./env.sh python fun/life_chip.py --bench --gens 1001  1001 generations per NPU call, race numpy
 
 life.py sends every band with a halo of G rows and the host rebuilds the halos between calls.
 Here the world goes onto the chip once per call and stays there for GENS generations:

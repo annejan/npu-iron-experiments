@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Convolution reverb on the NPU: a 65536-tap impulse response (1.4 s at 48 kHz), 2048 taps per core.
 
-  ../env.sh python fun/reverb.py in.wav                 offline: NPU vs numpy FFT convolution, writes in.reverb.wav
-  ../env.sh python fun/reverb.py in.wav --play          live: block by block through the NPU into the speakers
-  ../env.sh python fun/reverb.py in.wav --ir hall.wav   use a real impulse response (first channel, same sample rate as the audio)
-  ../env.sh python fun/reverb.py --live [--seconds 30]  microphone in -> NPU reverb -> headphones (an effect pedal; use headphones, speakers feed back)
+  ./env.sh python fun/reverb.py in.wav                 offline: NPU vs numpy FFT convolution, writes in.reverb.wav
+  ./env.sh python fun/reverb.py in.wav --play          live: block by block through the NPU into the speakers
+  ./env.sh python fun/reverb.py in.wav --ir hall.wav   use a real impulse response (first channel, same sample rate as the audio)
+  ./env.sh python fun/reverb.py --live [--seconds 30]  microphone in -> NPU reverb -> headphones (an effect pedal; use headphones, speakers feed back)
 
 Direct-form FIR, int16 Q15 samples and taps, 32-bit partial sums. Core k owns taps [kT, (k+1)T) of the IR;
 per block of B outputs it gets a window of B+T-1 input samples plus its (reversed) tap segment, multiplies

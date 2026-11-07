@@ -1,4 +1,8 @@
-"""Life patterns in RLE (the format of LifeWiki and Golly), and a stamp to put them in a world."""
+"""Life patterns in RLE (the format of LifeWiki and Golly), and a stamp to put them in a world.
+
+Patterns as catalogued on LifeWiki (conwaylife.com/wiki); Gosper glider gun by Bill Gosper (1970), Simkin glider gun by
+Michael Simkin (2015).
+"""
 
 import re
 

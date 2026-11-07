@@ -59,7 +59,7 @@ void burn(int16_t *__restrict in, int16_t *__restrict out, int32_t reps) {
 chunk_ty = np.ndarray[(N,), np.dtype[np.int16]]
 for name, src in VARIANTS.items():
     ef = ExternalFunction("burn", source_string=src, arg_types=[chunk_ty, chunk_ty, np.dtype(np.int32)])
-    d = Path(".remarks/rem_" + name); d.mkdir(parents=True, exist_ok=True)
+    d = Path(__file__).resolve().parent.parent / ".remarks" / ("rem_" + name); d.mkdir(parents=True, exist_ok=True)
     rep, why = remarks.analyze(ef, "aie2p", d)
     if rep is None: print(name, why); continue
     print(f"== {name}: libcalls={rep.libcalls} stack={rep.kernel_stack_bytes} notes={rep.schedule_notes}")

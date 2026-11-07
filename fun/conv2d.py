@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generic K x K convolution engine over a DDR world on all 32 cores (the Lenia machinery, parameterised).
 
-  ../env.sh python fun/conv2d.py        self-test: 3x3 and 7x7 Gaussian blurs against numpy
+  ./env.sh python fun/conv2d.py        self-test: 3x3 and 7x7 Gaussian blurs against numpy
 
 Conv2D(K, taps, post, params): taps is a K x K float kernel; post is the elementwise pass applied to the int16 Q15
 convolution result uq before storing (C++ snippet; "decay" multiplies by params['decay']). World and result are

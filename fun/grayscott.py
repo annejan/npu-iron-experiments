@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """Gray-Scott reaction-diffusion on the chip (Pearson's patterns), int16 Q14, world in L1 like slime.py.
 
-  ../env.sh python fun/grayscott.py [--F 0.037 --k 0.06] [--steps 8000]    write grayscott.png
-  ../env.sh python fun/grayscott.py --window                                keys: f/F and k/K move through Pearson's map
+  ./env.sh python fun/grayscott.py [--F 0.037 --k 0.06] [--steps 8000]    write grayscott.png
+  ./env.sh python fun/grayscott.py --window                                keys: f/F and k/K move through Pearson's map
 
 u_t = Du lap u - u v^2 + F (1 - u);  v_t = Dv lap v + u v^2 - (F + k) v,  Du = 0.16, Dv = 0.08, dt = 1 (the classic
 Karl Sims / Pearson scaling with the 5-point Laplacian). Two int16 Q14 fields per band row [u | v]; the reaction term
 is two int16 x int16 products with shifts. Default (F, k) = (0.037, 0.060): worms and coral; (0.0545, 0.062): mitosis;
 (0.014, 0.054): chaos; (0.030, 0.062): solitons.
+
+P. Gray and S. K. Scott, Chem. Eng. Sci. 39:1087, 1984; J. E. Pearson, "Complex Patterns in a Simple System", Science
+261:189-192, 1993; the (F, k) presets follow Pearson's map as charted by R. Munafo (mrob.com/pub/comp/xmorphia) and
+K. Sims (karlsims.com/rd.html).
 """
 import argparse, sys, time
 import numpy as np

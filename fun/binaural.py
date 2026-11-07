@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """Binaural rendering on the NPU: 32 sound sources around your head, one per core, MIT KEMAR HRTFs.
 
-  ../env.sh python fun/binaural.py             render a circular arpeggio, write binaural_arpeggio.wav (headphones!)
-  ../env.sh python fun/binaural.py --play      play it live, block by block through the NPU
-  ../env.sh python fun/binaural.py --seconds 20
+  ./env.sh python fun/binaural.py             render a circular arpeggio, write binaural_arpeggio.wav (headphones!)
+  ./env.sh python fun/binaural.py --play      play it live, block by block through the NPU
+  ./env.sh python fun/binaural.py --seconds 20
 
 Each core owns one source: per block of B samples it gets the source's history window and the left and right
 head-related impulse responses for the source's current direction (MIT KEMAR "compact" set, 128 taps at 44.1 kHz,
 resampled to 48 kHz, 160-tap slots, interaural delay included), runs two FIRs with sliding_mac<32, 8>, and returns
 two int32 partials; the host sums 32 of each ear. Sources: 32 plucked notes (Karplus-Strong on the host) placed every
 11.25 degrees, triggered in turn, the whole ring slowly rotating. The data set is downloaded to data/kemar/ on first run.
+
+HRTFs: MIT KEMAR compact set, Copyright 1994 MIT Media Laboratory, free to use provided the authors are cited:
+W. G. Gardner and K. D. Martin, "HRTF Measurements of a KEMAR Dummy-Head Microphone", MIT Media Lab Perceptual
+Computing Technical Report 280, 1994, https://sound.media.mit.edu/resources/KEMAR.html (downloaded to data/kemar/ on
+first run, not redistributed). The plucked notes are Karplus-Strong strings (K. Karplus and A. Strong, Computer Music
+Journal 7(2):43-55, 1983).
 """
 import argparse, io, os, sys, time, urllib.request, zipfile
 import numpy as np

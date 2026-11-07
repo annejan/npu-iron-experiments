@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Game of Life on the NPU: the world is cut in bands, one AIE core per column works its bands.
 
-  ../env.sh python life.py              random soup, as big as the terminal
-  ../env.sh python life.py --gens 7     7 generations per NPU call (odd numbers only)
-  ../env.sh python life.py --check      compare every NPU step with numpy
+  ./env.sh python fun/life.py              random soup, as big as the terminal
+  ./env.sh python fun/life.py --gens 7     7 generations per NPU call (odd numbers only)
+  ./env.sh python fun/life.py --check      compare every NPU step with numpy
 
 Each band travels to its core with GENS extra rows (a halo) above and below. The core runs GENS
 generations on its own: every generation the valid part shrinks by one row at each side, so after

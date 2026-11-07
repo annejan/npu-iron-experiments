@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Integer excitable-media automata on the chip: cyclic CA (demons) and Greenberg-Hastings (spiral waves).
 
-  ../env.sh python fun/spiral.py [--rule cyclic|gh] [--steps 2000]     write spiral_<rule>.png, check 20 steps vs numpy
-  ../env.sh python fun/spiral.py --window [--rule gh]
+  ./env.sh python fun/spiral.py [--rule cyclic|gh] [--steps 2000]     write spiral_<rule>.png, check 20 steps vs numpy
+  ./env.sh python fun/spiral.py --window [--rule gh]
 
 cyclic: n = 16 states, a cell in state s becomes (s + 1) mod n when a 4-neighbour is already in that state.
 gh: n = 8 states: 0 rest, 1 excited, 2..7 refractory; rest cells get excited when an 8-neighbour is excited,
 all other states advance by one (7 -> 0). Exact integers in int16 lanes, world 512x512 on chip (slime.py layout).
+
+J. M. Greenberg and S. P. Hastings, SIAM J. Appl. Math. 34(3):515-523, 1978; cyclic CA: D. Griffeath (R. Fisch, J. Gravner,
+D. Griffeath, "Threshold-range scaling of excitable cellular automata", Statistics and Computing 1:23-39, 1991).
 """
 import argparse, sys, time
 import numpy as np

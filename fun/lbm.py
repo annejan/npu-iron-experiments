@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Lattice-Boltzmann (D2Q9, BGK) fluid on all 32 AIE cores: flow past a cylinder, vortex street.
 
-  ../env.sh python fun/lbm.py              bench, write lbm.png
-  ../env.sh python fun/lbm.py --window     pygame: click/drag = draw obstacles, C = clear, ESC
+  ./env.sh python fun/lbm.py              bench, write lbm.png
+  ./env.sh python fun/lbm.py --window     pygame: click/drag = draw obstacles, C = clear, ESC
 
 Nine distributions per cell do not fit the cores' 64 KB with a world worth looking at, so the world lives
 in DDR and streams through the chip once per step: each core takes a band of R rows plus one halo row

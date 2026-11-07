@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """1080p plasma rendered by all 32 AIE cores, packed RGBA straight from the NPU.
 
-  ../env.sh python probe/plasma.py            bench: frames/s, writes plasma.png
-  ../env.sh python probe/plasma.py --window   pygame window
+  ./env.sh python probe/plasma.py            bench: frames/s, writes plasma.png
+  ./env.sh python probe/plasma.py --window   pygame window
 
 Host sends per-frame sine tables (3 per-x, 3 per-y, int32 Q12, 36 KB); each core renders 34 rows
 (row y = 32*j + 4*col + row), a row at a time through a depth-2 ObjectFifo; the 4 cores of a column

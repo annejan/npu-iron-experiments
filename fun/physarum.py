@@ -2,14 +2,17 @@
 """Physarum (slime mould) agents on the CPU, trail diffusion and decay on the NPU: the real network-forming
 algorithm (Jones 2010), as a hybrid.
 
-  ../env.sh python fun/physarum.py --steps 1500        write physarum.png
-  ../env.sh python fun/physarum.py --window            pygame (N: reseed, ESC)
+  ./env.sh python fun/physarum.py --steps 1500        write physarum.png
+  ./env.sh python fun/physarum.py --window            pygame (N: reseed, ESC)
 
 Agents sense the trail at three points ahead (distance SO, angles -SA, 0, +SA), turn toward the strongest by RA,
 move SS, deposit. That part is gather/scatter (numpy, vectorised with bincount). Every step the trail map is then
 blurred (3x3 mean) and decayed on the NPU through fun/conv2d.py. Food sources deposit constantly, so the network
 grows between them. The honest division of labour: the NPU does the dense part (0.3 ms per 512x512 step), the CPU
 the agents (about 10 ms per 100k agents); the point is the result, not the NPU load.
+
+Agent model: Jeff Jones, "Characteristics of pattern formation and evolution in approximations of Physarum transport
+networks", Artificial Life 16(2):127-153, 2010.
 """
 import argparse, sys, time
 import numpy as np

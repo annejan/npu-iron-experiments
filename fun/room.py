@@ -2,8 +2,8 @@
 """Room acoustics: a 3-D FDTD wave simulation on all 32 AIE cores, recording an impulse response you can
 then play through fun/reverb.py.
 
-  ../env.sh python fun/room.py                 simulate 1 s at 8 kHz, write room_ir_8k.wav, room_ir_48k.wav, room.png
-  ../env.sh python fun/room.py --steps 2000    shorter
+  ./env.sh python fun/room.py                 simulate 1 s at 8 kHz, write room_ir_8k.wav, room_ir_48k.wav, room.png
+  ./env.sh python fun/room.py --steps 2000    shorter
 
 Grid NX x NY x NZ = 32 x 32 x 128 cells, dx = c*dt*sqrt(3)/... we use lambda = c dt / dx = 0.5 (< 1/sqrt(3), stable),
 so at fs = 8 kHz, dx = 343 / 8000 / 0.5 = 8.6 cm: a 2.7 m x 2.7 m x 11 m corridor. Pressure p in int32 Q28

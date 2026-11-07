@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Slime mould / ant trails as a grid chemotaxis sim on the chip: 32 AIE cores in a snake, halos over shared memory.
 
-  ../env.sh python fun/slime.py              bench, write slime.png
-  ../env.sh python fun/slime.py --window     pygame (click = food, N = reseed, q/a w/s e/d r/f t/g tune parameters, ESC)
+  ./env.sh python fun/slime.py              bench, write slime.png
+  ./env.sh python fun/slime.py --window     pygame (click = food, N = reseed, q/a w/s e/d r/f t/g tune parameters, ESC)
 
 Per cell: a = organism density, p = pheromone/trail, f = food (constant). Every step (all bf16, 4-neighbour stencil):
   flux from c to neighbour n:  F = upwind(a) * clamp(p_n - p_c) + D * (a_c - a_n)     (conservative)

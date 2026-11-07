@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Blobs: four spheres and a floor joined with smooth-min, sphere traced on all 32 AIE cores.
 
-  ../env.sh python fun/blob.py            bench, write blob.png
-  ../env.sh python fun/blob.py --window   pygame window
-  ../env.sh python fun/blob.py --check    static loop report
+  ./env.sh python fun/blob.py            bench, write blob.png
+  ./env.sh python fun/blob.py --window   pygame window
+  ./env.sh python fun/blob.py --check    static loop report
 
-The "bloep": smin(a, b, k) = min(a, b) - h*h*k/4 with h = max(k - |a - b|, 0) / k. Every op is
+The "bloep" (Dutch for the plop two blobs make when they merge): smin(a, b, k) = min(a, b) - h*h*k/4 with h = max(k - |a - b|, 0) / k. Every op is
 native in bf16 (sub, abs, max, mul, msc). The normal is a numeric gradient: three extra distance
 evaluations at the hit point only, not per step. Frame plumbing, window and bench come from sdf.py.
+
+Smooth-min after Inigo Quilez (iquilezles.org/articles/smin); sphere tracing: J. C. Hart, The Visual Computer 12:527-545, 1996.
 """
 import argparse, sys
 from pathlib import Path
@@ -182,7 +184,7 @@ def params(t):
 
 def check(steps):
     from aie.utils.compile import remarks
-    d = Path(".remarks/rem_blob")
+    d = Path(__file__).resolve().parent.parent / ".remarks" / ("rem_blob")
     d.mkdir(parents=True, exist_ok=True)
     rep, why = remarks.analyze(ext(steps), "aie2p", d)
     if rep is None:

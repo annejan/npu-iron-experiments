@@ -2,14 +2,17 @@
 """2-D Ising model on the chip: checkerboard Metropolis with an xorshift RNG in the vector lanes, checked
 against Onsager's exact magnetisation.
 
-  ../env.sh python fun/ising.py                 sweep temperatures, print |M| vs Onsager, write ising.png (lattice at Tc)
-  ../env.sh python fun/ising.py --window        pygame: temperature with up/down keys
+  ./env.sh python fun/ising.py                 sweep temperatures, print |M| vs Onsager, write ising.png (lattice at Tc)
+  ./env.sh python fun/ising.py --window        pygame: temperature with up/down keys
 
 Spins s = +-1 as int16, world 512x512 in the 32 cores' L1 (slime.py layout: bands, halo rows over shared memory,
 ping-pong). One call = STEPS half-sweeps; a half-sweep updates one checkerboard colour: dE = 2 s (sum of the 4
 neighbours) in {-8..8}; flip if dE <= 0, else with probability exp(-dE/T), decided per lane against a 16-bit random
 number from a per-core xorshift32 generator (static state in L1, seeded per core). Thresholds for dE = 4 and 8 are
 compile-time constants, so the temperature is a variant of the design (recompile ~2 s, cached per T).
+
+Exact results: L. Onsager, Phys. Rev. 65:117, 1944 (energy); C. N. Yang, Phys. Rev. 85:808, 1952 (spontaneous
+magnetisation (1 - sinh^-4(2/T))^(1/8)).
 """
 import argparse, sys, time
 import numpy as np

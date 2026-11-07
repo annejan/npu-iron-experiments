@@ -1,12 +1,70 @@
-# IRON on the Krackan NPU
+# IRON experiments on a Ryzen AI NPU
 
-mlir-aie 1.4.5 (IRON) with XRT 2.26 unpacked in `../ryzenai`. `./setup.sh` once, then
-`./env.sh CMD...` for everything.
+One night (7 November 2026) of finding out what the NPU in an AMD Ryzen AI 7 PRO 350 laptop
+(a ThinkPad; XDNA2, AMD codename Krackan Point, `xrt-smi` calls it "NPU Krackan") is good at,
+programmed directly in IRON, the Python front end of AMD/Xilinx [mlir-aie](https://github.com/Xilinx/mlir-aie)
+1.4.5, under Linux (openSUSE Tumbleweed, kernel 7.3 with the in-tree `amdxdna` driver). Demoscene
+effects, physics simulations, audio DSP and one real object detector, each checked against numpy
+and timed; plus the probes that measured the chip's ceilings, and every trap hit on the way.
+
+Most of the code was written by [Claude Code](https://claude.com/claude-code) (Anthropic's agent)
+working with Anne Jan Brouwer over one evening and night; every commit carries a `Co-Authored-By`
+trailer saying so. All numbers are measurements on this one laptop, not AMD specifications, unless
+a line says otherwise. See "Credits and licences" at the end for what is borrowed from whom.
+
+Short version: the chip is 32 small vector cores with 64 KB each, fed by fast DMA. It shines on
+anything branchless and MAC-shaped where every lane does the same work: stencils, convolutions,
+FIR audio, int8 matrix multiplies, lookup tables. It is poor at gathers, trig, fp32 multiplies and
+anything that needs a big table. A dispatch costs ~160 us before any work, so batch work per call.
+
+## Setup
+
+Hardware and kernel: a Ryzen AI 300 NPU (Strix Point, Krackan Point or Strix Halo; PCI `1022:17f0`),
+Linux 6.14 or newer with the in-tree `amdxdna` driver (`CONFIG_DRM_ACCEL_AMDXDNA`) and the `amdnpu`
+firmware (Tumbleweed: `kernel-default` + `kernel-firmware-platform`). `/dev/accel/accel0` is owned by
+`root:render`, so add yourself to the `render` group. `lsmod | grep amdxdna` and `ls /lib/firmware/amdnpu`
+tell you whether both are there.
+
+XRT (AMD's runtime) is not in any distribution. This repo expects it unpacked, not installed, in
+`../ryzenai` (nothing goes into `/opt`):
 
 ```
-./env.sh python fun/mandel.py          # scripts: relative path, from this directory
-./env.sh python probe/plasma.py --window
+mkdir -p ../ryzenai/dl ../ryzenai/x && cd ../ryzenai
+# into dl/: RAI_1.9_Linux_NPU_XRT.zip from AMD's "Ryzen AI Software 1.9, Linux" download page (AMD EULA), which holds
+#   xrt_202620.2.26.89_24.04-amd64-{base,base-dev,npu}.deb and xrt_plugin.2.26.260102.59.release_24.04-amd64-amdxdna.deb,
+# plus the two Ubuntu 24.04 packages the XRT binaries link against:
+#   libboost-filesystem1.83.0_*.deb and libboost-program-options1.83.0_*.deb (packages.ubuntu.com)
+for d in dl/*.deb; do dpkg-deb -x "$d" "x/$(basename "$d" .deb)"; done     # no dpkg? ar p X.deb data.tar.zst | tar -x --zstd
+mkdir -p xrt boost
+for p in x/xrt_*/opt/xilinx/xrt x/xrt_plugin*/opt/xilinx/xrt; do cp -a "$p/." xrt/; done
+cp -a x/libboost*/usr boost/
 ```
+
+`env.sh` points `XILINX_XRT`, `LD_LIBRARY_PATH` and `PYTHONPATH` (for `pyxrt`) at those two
+directories. `pyxrt` is built for CPython 3.12 and the `mlir_aie` wheel is `cp312`, hence `python3.12`
+in `setup.sh` (Tumbleweed: `zypper in python312`). Then, from this directory:
+
+```
+./setup.sh                      # clones mlir-aie v1.4.5 (no submodules), makes ironenv/ with mlir_aie 1.4.5,
+                                # the pinned Peano (llvm-aie) compiler and the demo extras (~2 GB)
+./env.sh xrt-smi examine        # the device: "NPU Krackan 1 | aie2p | 6x8"
+```
+
+## Quick start
+
+```
+./env.sh make -C mlir-aie/programming_examples/basic/vector_scalar_mul run_py   # smoke test, ends with PASS!
+./env.sh python probe/plasma.py --window        # 1080p plasma in a pygame window
+./env.sh python fun/mandel.py                   # Mandelbrot zoom in the terminal; --png out.png writes one frame
+./env.sh python fun/lenia.py --window           # Lenia
+./env.sh python fun/reverb.py --live            # microphone -> NPU convolution reverb -> headphones
+```
+
+Every command runs from this directory (the scripts find each other through `fun/` and `probe/`).
+The first run of each design compiles its kernels (0.4-1.7 s, cached in `~/.npu/cache`,
+`NPU_CACHE_HOME` overrides), and every `./env.sh` call runs `xrt-smi examine` once to find the device,
+so starts take a moment. Run one NPU job at a time. `--window` needs pygame-ce; the audio demos need
+soundfile and sounddevice, the live ones headphones.
 
 
 ## Pictures
@@ -17,7 +75,10 @@ mlir-aie 1.4.5 (IRON) with XRT 2.26 unpacked in `../ryzenai`. `./setup.sh` once,
 | ![Ising](docs/img/ising.png) Ising at Tc | ![LBM](docs/img/lbm.png) Lattice-Boltzmann vortex street | ![Water](docs/img/water.png) Ripple tank |
 | ![SDF](docs/img/sdf64.png) SDF sphere tracer | ![Blobs](docs/img/blob48.png) Smooth-min blobs | ![Mandelbrot](docs/img/mandel.png) Mandelbrot, 32 cores |
 | ![Sandpile](docs/img/sandpile.png) Abelian sandpile, 2^18 grains | ![Gray-Scott](docs/img/grayscott.png) Gray-Scott coral | ![YOLO](docs/img/yolo_coco.png) YOLO26n, 150 fps, real weights |
-| ![Cyclic](docs/img/spiral_cyclic.png) Cyclic CA demons | ![GH](docs/img/spiral_gh.png) Greenberg-Hastings spirals | |
+| ![Cyclic](docs/img/spiral_cyclic.png) Cyclic CA demons | ![GH](docs/img/spiral_gh.png) Greenberg-Hastings spirals | ![Plasma](docs/img/plasma.png) 1080p plasma, 0.34 ms/frame |
+| ![Room](docs/img/room.png) Corridor impulse response, 3-D FDTD | | |
+
+(The YOLO picture is COCO 2017 image 30: photo by julie, https://www.flickr.com/photos/roosterfarm/3573516590, CC BY 2.0, boxes added.)
 
 ## Hardware (xrt-smi: "NPU Krackan 1", aie2p, 6x8)
 
@@ -31,12 +92,22 @@ mlir-aie 1.4.5 (IRON) with XRT 2.26 unpacked in `../ryzenai`. `./setup.sh` once,
 | Native math | int add/mul/mac/shift/cmp/select/shuffle, bf16 mul, `aie::inv`, `aie::invsqrt`, `aie::sqrt`, `aie::exp2`, `aie::tanh` (bf16) |
 | Not native | float vector multiply (emulated via bf16, ~50 bundles/vector), scalar float mul/div, int32 divide, 64-bit multiply, sin/cos (use tables / polynomials), per-lane gather |
 
+Sources: the name and the 6x8 array from `xrt-smi examine`; tile memories, DMA channels and lane
+widths from the AIE-ML v2 (aie2p) architecture documentation and `mlir-aie/programming_guide/section-1`.
+AMD does not publish the clock: ~1.76 GHz is what the II-1 loop in `probe/burn.py` implies, and
+`probe/npu_top.py` reads the driver's H clock. "Native" means Peano compiles it to vector
+instructions rather than a library call.
+
 ## Measured ceilings (2026-11-07, `probe/`)
+
+All numbers: this one laptop, Linux, XRT 2.26, mlir-aie 1.4.5, default power mode, CPU idle unless
+stated, min or median after a warm-up call, host wall clock from Python unless the row says NPU time.
+"1080p" frames are 1920x1088 (32 cores x 34 rows) cropped to 1080.
 
 | What | Number |
 |---|---|
 | Dispatch floor, host wall clock | ~155-180 us per call |
-| Host <-> NPU DMA, all 8 columns, in and out at the same time | ~30 GB/s each way = 63 GB/s aggregate at 64 MB, 21 GB/s each way at 8 MB; a second shim channel per column or 64 KB objects change nothing (`probe/bw.py`, `probe/bw2.py`). Others report 50-98 GB/s one-way on this chip |
+| Host <-> NPU DMA, all 8 columns, in and out at the same time | ~31 GB/s each way = 63 GB/s aggregate at 64 MB, 21 GB/s each way at 8 MB; a second shim channel per column or 64 KB objects change nothing (`probe/bw2.py`; `probe/bw.py` with one channel and 16 KB objects: 26 GB/s). ghost-intuit report 52-98 GB/s one way on a Strix Point under Windows |
 | 1920x1088 RGBA frame out | ~0.31 ms |
 | One core, int16 vector mul loop at II 1 | ~52 G elements/s (ideal 56) (`probe/burn.py`) |
 | All 32 cores, same loop, wall clock incl. floor | ~850 G int16 ops/s |
@@ -47,21 +118,21 @@ mlir-aie 1.4.5 (IRON) with XRT 2.26 unpacked in `../ryzenai`. `./setup.sh` once,
 | Blobs 1080p, 4 spheres + floor smooth-min, 48 steps, 5 distance evals per step | 38 ms/frame, 26 fps (`fun/blob.py`) |
 | Slime chemotaxis 320x256, bf16, world on chip, 15 steps/dispatch | 41k steps/s, 3.4 Gcell-steps/s (`fun/slime.py`) |
 | Ripple tank 320x384, int16 Q12, world on chip, 5 steps/dispatch | 17k steps/s, 2.1 Gcell-steps/s (`fun/water.py`) |
-| Convolution reverb, 65536 taps, 2048-sample blocks, stereo | 0.43 ms per block per channel, 308 GMAC/s, 41x real time, bit-exact vs FFT (`fun/reverb.py`) |
+| Convolution reverb, 65536 taps, 2048-sample blocks, stereo | 0.43 ms NPU per block per channel (43 ms of audio), 308 GMAC/s in the calls; 41x real time over the whole Python loop on a stereo file, bit-exact vs FFT (`fun/reverb.py`) |
 | Lenia 512x512, 27x27 kernel (729 taps/cell), int16 Q15 | 0.65-0.84 ms/step, 1200-1500 steps/s, ~250 GMAC/s, conv exact to 6 LSB (`fun/lenia.py`) |
-| Additive synth, 3072 partials, 1024-sample blocks | 0.38 ms per block = 8 G partial-samples/s (~8000x real time), amplitude drift-free, 0.03 Hz tuning (`fun/additive.py`) |
+| Additive synth, 3072 partials, 1024-sample blocks | 0.38 ms per block (21 ms of audio: 56x real time for all 3072 partials) = 8 G partial-samples/s, amplitude drift-free, 0.03 Hz tuning (`fun/additive.py`) |
 | Binaural, 32 sources x 2 ears x 160 taps, 1024-sample blocks | 0.28 ms per block (dispatch-bound), bit-exact, 38x real time (`fun/binaural.py`) |
 | conv2d engine 512x512: K=3 / 7 / 15 | 0.27 / 0.35 / 0.91 ms per pass, 1-4 LSB vs numpy (`fun/conv2d.py`) |
 | Physarum 120k agents + NPU blur | 13.8 ms/step total, NPU 0.7 ms of it (the agents are the cost) (`fun/physarum.py`) |
 | Ising 512x512, 20 half-sweeps per dispatch | 2-3 G spin-updates/s (7-11k sweeps/s); |M| and E within 1% of Onsager at T = 1.5..3.5 (`fun/ising.py`) |
-| YOLO26n (stock example), whole network on 32 tiles, batch 1 | real XINT8 weights: **6.5 ms per 640x640 image = 150 fps**, 8/8 coco128 images bit-exact vs the oracle and ONNX Runtime, mAP50 0.97; seeded weights measured 11.3 ms with the CPU busy |
+| YOLO26n (stock example), whole network on 32 tiles, batch 1 | **6.5 ms per 640x640 image = 150 fps** with the real XINT8 weights, 8/8 coco128 images bit-exact vs the integer oracle and ONNX Runtime, mAP50 0.97 on those 8. The same network measured 11.3 ms earlier, with seeded weights while the export saturated the CPU (see the CPU-load note) |
 | 2-D Schrodinger 512x512, int32, 1 step/dispatch (R for 3 rows + I for 1 per output row) | 0.47 ms/step, 2100 steps/s; norm conserved to 0.3% over 1400 steps (`fun/schrodinger.py`) |
 | Sandpile 512x512, 101 rounds/dispatch | 90k rounds/s (2^18 grains stable in 50k rounds = 0.6 s), grains conserved exactly (`fun/sandpile.py`) |
 | Cyclic CA / Greenberg-Hastings 512x512, int16, 21 steps/dispatch | 45k / 39k steps/s = 12 / 10 Gcell-steps/s, bit-exact (`fun/spiral.py`) |
 | Gray-Scott 512x256, 101 steps/dispatch | 4300 steps/s, 0.6 Gcell-steps/s (`fun/grayscott.py`) |
 | 3-D wave FDTD 32x32x128 (131k cells), int32, 1 step/dispatch | 0.21 ms/step NPU, 0.26-0.31 ms incl. host readback: 1 s of 8 kHz room response in 2.5 s (`fun/room.py`) |
 | LBM D2Q9 384x256, bf16 deviations, 1 step per dispatch (DMA-bound) | 2700 steps/s, 0.27 Gcell-steps/s (`fun/lbm.py`) |
-| Mandelbrot 1080p, 400 iterations, Q24 int32, 16 lanes, 32 cores | 26.9 ms (numpy 5.4 s; old scalar int64 kernel on 8 cores 34x slower) (`fun/mandel.py --bench`) |
+| Mandelbrot 1080p, 400 iterations, Q24 int32, 16 lanes, 32 cores | 26.9 ms (numpy 5.4 s); the old scalar int64 kernel is 34x slower per core, both measured at 480x270 on 32 cores (`fun/mandel.py --bench`) |
 
 Rule of thumb for effects: a dispatch costs ~160 us before any work, a full-HD frame
 costs ~0.3 ms of DMA, and compute is almost free unless the kernel is scalar.
@@ -75,25 +146,39 @@ Batch work per dispatch; keep one call per frame.
 | `life.py`, `life_chip.py`, `life_window.py` | Game of Life, host-halo and on-chip (snake of 32 cores) variants, pygame window |
 | `rotozoom.py` | rotozoomer + tunnel, `--window` (TAB switches) |
 | `sdf.py` | sphere-traced signed distance field (repeated spheres + floor), `--window`, `--check` for the static loop report |
-| `blob.py` | four spheres + floor joined with smooth-min (the "bloep"), numeric normals, specular; reuses sdf.py's plumbing |
+| `blob.py` | four spheres + floor joined with smooth-min (the "bloep", Dutch for the plop of merging blobs), numeric normals, specular; reuses sdf.py's plumbing |
 | `slime.py` | slime mould / ant trails as grid chemotaxis (density + pheromone, conservative upwind flux), on-chip world, `--window` (click = food) |
 | `water.py` | ripple tank, int16 Q12 height field, on-chip world, `--window` (drag = drops, R = rain) |
 | `reverb.py` | convolution reverb: 65536-tap IR (1.4 s), 2048 taps per core, int16 Q15, `sliding_mac` FIR; `in.wav` offline with numpy check, `--play` live through the speakers, `--live` microphone -> headphones (3% load) |
 | `lenia.py` | Lenia continuous CA: 27x27 ring-kernel convolution per step via `sliding_mac`, DDR world streamed through the cores with a 27-row ring buffer in L1, bf16 growth; `--window` |
 | `room.py` | 3-D FDTD room acoustics (32x32x128 cells, int32 Q28, 8 kHz), streams z-planes through the cores, records a stereo impulse response; `--check` vs numpy |
-| `binaural.py` | 32 sources around the head, one per core, MIT KEMAR HRTFs (downloaded to `data/kemar/`), two `sliding_mac` FIRs per core; writes `binaural_arpeggio.wav`, `--play` live |
+| `binaural.py` | 32 sources around the head, one per core, MIT KEMAR HRTFs (Gardner & Martin 1994, downloaded to `data/kemar/` on first run), two `sliding_mac` FIRs per core; writes `binaural_arpeggio.wav`, `--play` live |
 | `conv2d.py` | generic K x K convolution engine over a DDR world (the Lenia machinery parameterised), self-test vs numpy |
 | `physarum.py` | real slime-mould networks (Jones 2010 agents on the CPU, trail blur + decay on the NPU via conv2d) |
 | `ising.py` | 2-D Ising, checkerboard Metropolis, xorshift32 RNG in the lanes, world on chip; |M| and E vs Onsager's exact solution; `--window` (up/down: temperature) |
-| `yolo_cam.py` | YOLO26n object detection on the webcam or an image, via the stock `mlir-aie/programming_examples/ml/yolo26n` (needs its exported weights) |
+| `yolo_cam.py` | YOLO26n object detection on the webcam or an image, via the stock `mlir-aie/programming_examples/ml/yolo26n`. Needs its exported weights: follow that example's README (`make export`, `make data` with `IRON_EXAMPLE_WEIGHTS_DIR` set; the Ultralytics checkpoint is AGPL and not in this repo; ~25 min of calibration). `--synthetic 7` runs without a checkpoint (timing real, boxes noise) |
 | `schrodinger.py` | 2-D Schrodinger equation, Visscher scheme, int32 Q28, 5-row sliding window; a wave packet through a double slit; `--check` vs numpy |
-| `sandpile.py` | Abelian sandpile, exact int16 stencil on chip, 2^18 grains dropped in portions (abelian), the fractal in `sandpile.png` |
+| `sandpile.py` | Abelian sandpile, exact int16 stencil on chip, 2^18 grains (the default; 2^19 runs off the 512 grid) dropped in portions (abelian), the fractal in `sandpile.png` |
 | `grayscott.py` | Gray-Scott reaction-diffusion, int16 Q14, world on chip; `--F --k` or live keys through Pearson's map |
 | `water_resident.py` | the ripple tank with its world resident in L1 across dispatches (`Buffer` + `while_true` workers, one command object per call); measures the DDR saving and the autosuspend reset |
 | `additive.py` | additive synthesiser: 3072 partials as magic-circle oscillators, 32 samples of each sinusoid in the lanes, one rotation per sub-block, no trig; bells and STFT resynthesis to wav, bit-exact numpy replica |
 | `spiral.py` | integer excitable media on chip: cyclic CA (16 states, demons) and Greenberg-Hastings (8 states, spiral waves), bit-exact vs numpy |
 | `lbm.py` | Lattice-Boltzmann D2Q9 fluid, flow past a cylinder; world in DDR, streamed through all 32 cores every step, shim DMA gathers the halo rows with a 3-D pattern, cores use a 3-row sliding window (`acquire(3)`); `--window` (drag = obstacles, C = clear) |
-| `../probe/plasma.py` | 3-sine plasma, `--window` |
+| `fft.py` | the attempt at a batched FFT; kept as a design, its kernel does not compile on AIE2P/Peano (see the FFT section) |
+| `patterns.py` | RLE helper with the classic Life objects for `life_window.py` (no main) |
+| `probe/plasma.py` | 3-sine plasma, `--window` |
+
+## Probes (`probe/`)
+
+| | |
+|---|---|
+| `npu_top.py` | live NPU telemetry straight from the amdxdna driver (`/dev/accel/accel0` ioctl): clocks, power mode, hardware contexts; no root, no XRT; `--watch 0.5 --count N` |
+| `bw.py`, `bw2.py` | host <-> NPU DMA bandwidth and the dispatch floor (one vs two shim channels per column) |
+| `burn.py`, `burn2.py`, `sustain.py`, `clock_under_load.py` | per-core compute ceiling (II-1 vector loop), kernel variants, implied clock, long vs short calls, clock under CPU load |
+| `plasma.py` | 1080p plasma on 32 cores, the frame-output template; `--window` |
+| `lut.py` | `aie::parallel_lookup` against a scalar gather loop (palettes, textures) |
+| `fir_check.py`, `fir_floor.py`, `fir_alt.py`, `gs_check.py`, `ising_check.py` | static schedule (II, libcalls, stack) reports for the FIR, Gray-Scott and Ising kernels; where the reverb's time goes |
+| `lbm_check.py`, `lenia_dbg.py`, `lenia_dbg2.py`, `room_decay.py`, `room_rounding.py`, `slime_stats.py` | the debugging runs behind the lessons in this README (numpy emulations of rounding, mass and energy checks) |
 
 Shim DMA budget: each column's shim has 2 channels in and 2 out, so a design that gives every
 core its own host stream cannot go past 1 worker per column (`transform_parallel_binary` with
@@ -116,8 +201,8 @@ a big table or framebuffer in L1 (64 KB), fp32 multiplies, divides, trig, branch
 Trivial effects (plasma) are DMA-bound: writing the frame costs more than computing it.
 
 A ray-march step for 32 pixels is ~80 bundles with two rays interleaved (one ray alone: ~157;
-the chain is latency-bound, `ns` 1). AIE2P has only five accumulator registers, so more rays
-in flight spill to the stack.
+the chain is latency-bound, `ns` 1). Peano exposes five 512-bit accumulator registers on AIE2P, so
+more rays in flight spill to the stack (visible in the remarks).
 
 Precision lessons from `sdf.py`, each one cost a wrong picture:
 * a bf16 ray direction is too coarse (8 mantissa bits: neighbouring rows share a direction and
@@ -197,8 +282,8 @@ buys nothing: 0.221 ms per call against 0.230 ms with the whole world through DD
 1 MB round trip is ~10 us next to the ~160 us dispatch floor. Resident state only pays for worlds
 of many MB. And the catch: **after 5 s idle amdxdna suspends the device and the cores come back
 reset** (measured: energy 0.357 -> 0.000 after a 6.5 s pause), so a resident design needs a
-keep-alive call every few seconds or must re-upload after a pause (`llama_3_2_1b/README.md` says
-the same; `/sys/class/accel/accel0/device/power/autosuspend_delay_ms` is the knob, root only).
+keep-alive call every few seconds or must re-upload after a pause (the upstream example
+`mlir-aie/programming_examples/ml/llama_3_2_1b/README.md` says the same; `/sys/class/accel/accel0/device/power/autosuspend_delay_ms` is the knob, root only).
 
 ## The lookup unit: gathers after all (for tables)
 
@@ -236,8 +321,9 @@ all 32 tiles in one dispatch. On this Krackan with the real weights (`export_yol
 `gen_yolo_data.py`: torch CPU, ultralytics and amd-quark pip-install fine; the quantization
 calibration takes ~25 minutes of all cores): 8/8 coco128 images bit-exact against the integer oracle
 and ONNX Runtime, mAP50 0.97 on those 8, **6.5 ms per image on the NPU, 150 fps at batch 1**.
-`fun/yolo_cam.py` adds the webcam/letterbox/drawing (`--image`, `--still`, `--window`). While the
-export was calibrating on the CPU the same network measured 11.3 ms: see the CPU-load note below.
+`fun/yolo_cam.py` adds the webcam/letterbox/drawing (`--image`, `--still`, `--window`). Earlier, with
+seeded weights while the export was calibrating on all CPU cores, the same network measured 11.3 ms:
+see the CPU-load note below.
 
 ## Physarum, the honest version
 
@@ -283,8 +369,8 @@ stencil, leapfrog, lambda = c dt/dx = 0.5, dx 8.6 cm at 8 kHz), injects a pulse 
 ./env.sh python fun/reverb.py <drums.wav> --ir room_ir_48k.wav --wet 0.5
 ```
 
-plays the drum loop in the simulated corridor (`amen_in_the_simulated_corridor.wav`; RT60 about
-1.7 s, -30 dB after 0.85 s). 8000 steps take 2.5 s; the NPU dispatch is 0.21 ms of the 0.31 ms
+plays the drum loop in the simulated corridor (the script writes `<drums>.reverb.wav`; any 48 kHz
+loop will do, ours was a 200 bpm breakbeat; RT60 about 1.7 s, -30 dB after 0.85 s). 8000 steps take 2.5 s; the NPU dispatch is 0.21 ms of the 0.31 ms
 loop, the rest is reading the field back to pick two samples.
 
 Lesson: **int16 is not enough for a second-order wave update.** In int16 Q14 the field died
@@ -305,7 +391,7 @@ on separate int16 re/im vectors, or a DFT as an int16 matmul (W is 2048x2048 for
 points; batches of frames make it a wide GEMM, which this chip likes, but the acc32 sum of 2048
 Q15 products needs the output shift the stock kernel does not expose).
 
-## Dense matmul: how much of the 50 TOPS the stock example gets
+## Dense matmul: how much of AMD's rated 50 TOPS the stock example gets
 
 `mlir-aie/programming_examples/basic/matrix_multiplication/whole_array/whole_array.py`, 8 columns,
 int8 in and out, NPU time from the example's own benchmark (2026-11-07):
@@ -318,13 +404,13 @@ int8 in and out, NPU time from the example's own benchmark (2026-11-07):
 | 2048^3 | 128,64,64 | 15.8 | 32% |
 | 2048^3 | 128,32,128 | 16.9 | 34% |
 | 4096^3 | 128,64,64 | 14.6 | 29% |
-| 2048^3 int16 | 128,32,64 | 6.1 | 12% (int16 is 128 MAC/cycle, a quarter of int8) |
+| 2048^3 int16 | 128,32,64 | 6.1 | 12% (AIE-ML v2: int16 is 128 MAC/cycle per tile, a quarter of int8's 512) |
 
 The default tiles are DMA-bound; bigger output tiles (more MACs per byte moved) give 4x. Larger
 still does not fit: A, B and C tiles double-buffered must stay under 64 KB per core
-(`'aie.buffer' op could not be placed`). The ghost-intuit report reached 60% on a conv net with
-hand-written kernels and all 32 tiles per layer, so ~34% is the stock-example ceiling, not the
-chip's.
+(`'aie.buffer' op could not be placed`). The ghost-intuit write-up (next section) reached 60% on a
+conv net with hand-written kernels and all 32 tiles per layer, so ~34% is the stock-example ceiling,
+not the chip's. 50 TOPS is AMD's int8 rating for the Ryzen AI 300 NPU, not a measurement here.
 
 ```
 ./env.sh python mlir-aie/programming_examples/basic/matrix_multiplication/whole_array/whole_array.py \
@@ -333,8 +419,9 @@ chip's.
 
 ## From ghost-intuit/xdna2-npu-experiments (Strix Point, Windows, same silicon family)
 
-Read 2026-11-07, https://github.com/ghost-intuit/xdna2-npu-experiments (CC BY 4.0):
-* **NPU power mode.** `xrt-smi configure --pmode performance` raised the core clock from 1.40 GHz
+Read 2026-11-07, https://github.com/ghost-intuit/xdna2-npu-experiments (CC BY 4.0). Their numbers are
+from a Strix Point under Windows; each bullet says what was theirs and what was measured here.
+* **NPU power mode (theirs, then here).** `xrt-smi configure --pmode performance` raised the core clock from 1.40 GHz
   (default) to 1.81 GHz on their part. On this Linux box the ioctl needs root
   (`DRM_IOCTL_AMDXDNA_SET_STATE ... Permission denied`); try
   `sudo ../ryzenai/xrt/bin/xrt-smi configure --pmode performance` before compute-bound demos,
@@ -344,31 +431,63 @@ Read 2026-11-07, https://github.com/ghost-intuit/xdna2-npu-experiments (CC BY 4.
   vs 5.14 ms in performance, short 0.5 ms calls 512-659 vs 511 us: 4-9%, inside the run-to-run
   noise. The ray marchers and Mandelbrot did not move at all, and the SDF slope per march step
   (164k cycles per core in ~0.09 ms) implies ~1.8 GHz in both modes. An earlier "default" burn
-  figure of 630 us was a cold first run, not the mode. The paper's 1.40 GHz default was measured on
+  figure of 630 us was a cold first run, not the mode. Their 1.40 GHz default was measured on
   Windows; the Linux amdxdna driver appears to run near the top clock under load already. Setting
   the mode needs root (`./pmode.sh performance|default` wraps the sudo and library path).
-* **CPU load throttles the NPU, measured here**: with a model export saturating the CPU (load 24)
+* **CPU load throttles the NPU (here)**: with a model export saturating the CPU (load 24)
   `probe/npu_top.py` showed the H clock settling at 1150-1190 MHz under a sustained NPU load and
   the II-1 burn implied 0.96 GHz, against ~1.7 GHz with the CPU idle; YOLO26n took 11.3 ms instead
   of 6.5 ms. Keep the CPU quiet when timing, or when it matters.
-* **Fixed cost per call ~100 us** (89-95 us with no array activity), measured by trace; matches
-  the ~160 us we see from Python. One call per frame; batch steps.
-* **Heavy CPU load slows the NPU's data movement by up to 59%** (shared power budget, lower
+* **Fixed cost per call ~100 us (theirs)** (89-95 us with no array activity), measured by trace: the
+  on-device part of the ~155-180 us we see from Python, the rest being XRT and Python on the host.
+  One call per frame; batch steps.
+* **Heavy CPU load slows the NPU's data movement by up to 59% (theirs)** (shared power budget, lower
   fabric clock). A pygame loop that burns CPU on drawing slows the NPU it is timing. Pin the host
   process and keep the CPU quiet when measuring.
-* **int8 matmul is the chip's real peak**: 8x8x8 `mmul` = 512 MAC/cycle/tile, sustained 338-382;
+* **int8 matmul is the chip's real peak (theirs)**: 8x8x8 `mmul` = 512 MAC/cycle/tile, sustained 338-382;
   bfp16 (block floating point, shared 8-bit exponent) 261-274; **native bf16 matmul only 20-30
   MAC/cycle/tile**, about ten times slower. For heavy MAC work use int8 or bfp16, not bf16.
   (Our bf16 use is elementwise, 32 lanes/cycle, which is fine.)
-* On a 32-layer conv net the wins were spreading every layer over all 32 tiles and cutting
+* (Theirs) On a 32-layer conv net the wins were spreading every layer over all 32 tiles and cutting
   calls per inference; cutting DDR traffic by 61% gained 3%. Vitis AI reached 3-12% of the
   rating, hand-written IRON 24-60%.
 
-Honest verdict: the iGPU (Radeon 860M, ~3 TFLOPS fp32, native rsqrt, per-pixel early exit)
-renders these SDF scenes several times faster and in full precision. The NPU wins on dense
-int8/int16 matrix work (~50 TOPS vs ~12 for the iGPU), on power, and because it is a third
-engine running alongside CPU and GPU. Its demo role is neural: upscale, denoise, style the
-GPU's frame; generate audio; run a model (FastFlowLM in `../flm-portable`) next to the demo.
+Honest verdict: the iGPU (Radeon 860M: 8 CUs, roughly 3 TFLOPS fp32 and ~12 int8 TOPS on paper,
+not measured here; native rsqrt, per-pixel early exit) renders these SDF scenes several times faster
+and in full precision. The NPU wins on dense int8/int16 matrix work (rated ~50 TOPS vs ~12), on
+power, and because it is a third engine running alongside CPU and GPU. Its demo role is neural:
+upscale, denoise, style the GPU's frame; generate audio; run an LLM next to the demo
+([FastFlowLM](https://github.com/FastFlowLM/FastFlowLM) is a separate NPU runtime for this chip).
+
+## Credits and licences
+
+* The code in this repository is MIT (`LICENSE`), Copyright 2026 Anne Jan Brouwer. It was written
+  with Claude Code; the commit trailers name the agent.
+* One exception: the `Detector` class in `fun/yolo_cam.py` is adapted from the mlir-aie example
+  `programming_examples/ml/yolo26n/yolo26n.py`, Copyright 2026 Advanced Micro Devices, Inc.,
+  Apache-2.0 WITH LLVM-exception (`LICENSES/Apache-2.0-WITH-LLVM-exception.txt`).
+* [mlir-aie](https://github.com/Xilinx/mlir-aie) 1.4.5 (IRON, aie_api, the stock examples run
+  here), the Peano compiler ([llvm-aie](https://github.com/Xilinx/llvm-aie)) and
+  [XRT](https://github.com/Xilinx/XRT) are AMD/Xilinx projects under Apache-2.0 (with the LLVM
+  exception where it applies); none of them is vendored, `setup.sh` fetches them.
+* YOLO26n and its checkpoint are [Ultralytics](https://github.com/ultralytics/ultralytics)' (AGPL-3.0).
+  Neither the checkpoint nor the quantized parameters derived from it are in this repo, and no
+  ultralytics code is; the model runs through AMD's example. The class names are COCO 2017's.
+* `docs/img/yolo_coco.png` is COCO 2017 image 30 (coco128) with the NPU's boxes drawn on it:
+  "Untitled" by julie (flickr.com/photos/roosterfarm/3573516590), CC BY 2.0, modified (boxes and
+  labels added); COCO itself: Lin et al. 2014, annotations CC BY 4.0.
+* Measurements and findings quoted from
+  [ghost-intuit/xdna2-npu-experiments](https://github.com/ghost-intuit/xdna2-npu-experiments)
+  are theirs, CC BY 4.0.
+* HRTFs: the MIT KEMAR compact set, Copyright 1994 MIT Media Laboratory, W. G. Gardner and
+  K. D. Martin, "HRTF Measurements of a KEMAR Dummy-Head Microphone", MIT Media Lab Perceptual
+  Computing TR 280 (https://sound.media.mit.edu/resources/KEMAR.html); downloaded on first run,
+  not redistributed.
+* Algorithms are cited in each script's docstring: Lenia (Chan 2019), Physarum agents (Jones 2010),
+  the Gordon-Smith "magic circle" oscillator, Visscher's scheme, Gray-Scott/Pearson, Onsager and
+  Yang, Greenberg-Hastings and Griffeath's cyclic CA, Bak-Tang-Wiesenfeld, Quilez's SDF articles
+  and Hart's sphere tracing, Karplus-Strong, LifeWiki's pattern catalogue.
+* The drum loop used for the reverb and resynthesis demos is not included; use any 48 kHz wav.
 
 ## Gotchas
 
@@ -387,12 +506,13 @@ numbers appeared (2.3 vs 26 G ops/s per core).
 When a kernel edit "does nothing": bump or add a compile-time argument, or clear
 `~/.npu/cache`, before debugging the kernel.
 
-### env.sh and script paths
+### Run from the repo root
 
-`env.sh` sources `mlir-aie/utils/env_setup.sh` with the command line as its arguments.
-An absolute script path is then taken as a Peano install directory and fails with
-`Invalid Peano install directory: /...`. Run scripts with a relative path from this
-directory. The `realpath: invalid option` line it prints is harmless.
+`env.sh` sources `mlir-aie/utils/env_setup.sh`; a sourced script sees the caller's positional
+parameters, so until it was fixed env.sh handed its own command line to env_setup.sh as
+`<mlir-aie dir> <peano dir>` (absolute script paths failed with `Invalid Peano install directory`,
+and every call printed a `realpath` complaint). `env.sh` now clears `$@` before sourcing. The
+scripts still expect to run from this directory: `probe/*.py` do `sys.path.insert(0, "fun")`.
 
 ### No `python -I`
 
@@ -403,8 +523,8 @@ directory. The `realpath: invalid option` line it prints is harmless.
 
 ```python
 from pathlib import Path
-from aie.utils.compile import remarks            # needs: ironenv/bin/pip install pyyaml
-rep, why = remarks.analyze(ext_fn, "aie2p", Path("/tmp/rem"))
+from aie.utils.compile import remarks            # needs pyyaml (setup.sh installs it)
+rep, why = remarks.analyze(ext_fn, "aie2p", Path(".remarks/rem"))   # .remarks/ is gitignored
 for key, loop in rep.loops.items():
     print(key, loop.ii, loop.ns, loop.zol, loop.trips)
 print(rep.libcalls)                              # __muldi3, __divsi3, __mulsf3 ... = slow scalar paths
@@ -416,3 +536,28 @@ An II of 1 with `ns` 14 is the best case (one 512-bit load, one op, one store pe
 
 See `mlir-aie/programming_guide/section-4/` and `mlir-aie/skills/aie-kernel-opt/SKILL.md`
 for the full optimisation playbook.
+
+## Glossary
+
+* **IRON**: the Python API of mlir-aie (`aie.iron`): Workers, ObjectFifos, `@iron.jit`.
+* **Peano**: AMD's LLVM-based compiler for the AIE cores (pip `llvm-aie`); `aie_api` is its C++
+  vector library (`aie::vector`, `aie::accum`, `sliding_mac`, ...).
+* **aie2p / AIE-ML v2**: the core generation in XDNA2 (`xrt-smi`: "aie2p"); AIE1 is the older
+  Versal core many docs and examples still target.
+* **Tile rows**: row 0 shim tiles (DMA to host DDR, 2 channels each way per column), row 1 mem
+  tiles (512 KB, 6 channels each way), rows 2-5 compute cores. 8 columns, so 32 cores.
+* **L1**: a core's own 64 KB data memory (4 banks of 16 KB); neighbours can read each other's.
+* **ObjectFifo**: mlir-aie's double-buffered stream between tiles; `split`/`join` through the mem
+  tile fan one host stream out to several cores and back; `acquire(n)` gives a sliding window.
+* **Dispatch / call**: one host-side run of a compiled design (~160 us fixed cost here).
+* **Halo**: the neighbouring rows a stencil needs from the band above and below.
+* **Snake**: the 32 cores chained through shared memory so each band's halo rows come from the
+  physical neighbour, column by column up and down.
+* **Bundle / II / ns / zol**: one VLIW instruction word; initiation interval of a software-pipelined
+  loop (II 1 = one iteration per cycle); its stage count; zero-overhead loop. From the compiler's
+  remarks (`aie.utils.compile.remarks`).
+* **Qn**: fixed point with n fraction bits (Q12 int16: 1.0 = 4096; Q28 int32: 1.0 = 2^28).
+* **bf16 / bfp16 / XINT8**: 16-bit brain float (8 mantissa bits); block floating point with a
+  shared 8-bit exponent; AMD Quark's int8 recipe with power-of-two scales.
+* **MAC / GMAC/s**: multiply-accumulate; billions of them per second.
+* **FDTD**: finite-difference time-domain, the explicit wave-equation stencil.

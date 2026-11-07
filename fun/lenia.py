@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Lenia (continuous cellular automaton) on all 32 AIE cores: a 27x27 ring kernel convolution per step.
 
-  ../env.sh python fun/lenia.py             check the convolution against numpy, measure steps/s, write lenia.png
-  ../env.sh python fun/lenia.py --window    pygame
-  ../env.sh python fun/lenia.py --check     static compile report
+  ./env.sh python fun/lenia.py             check the convolution against numpy, measure steps/s, write lenia.png
+  ./env.sh python fun/lenia.py --window    pygame
+  ./env.sh python fun/lenia.py --check     static compile report
 
 World 512x512 in int16 Q15 (values 0..1) in DDR, streamed through the chip every step like lbm.py: each core
 takes a band of R rows plus K-1 halo rows (one 3-D shim DMA pattern per column), keeps the last K rows in a
@@ -13,6 +13,9 @@ data window, summed over the K rows in one int32 accumulator. Kernel taps are in
 Growth and update are a second, elementwise pass in bf16: u = conv; G = 2 exp(-(u-mu)^2 / (2 sigma^2)) - 1;
 a' = clip(a + dt G, 0, 1).  Default species: Orbium (R=13, mu=0.15, sigma=0.015, dt=0.1), ring kernel
 exp(4 - 1/(r(1-r))) on r = |x|/R, normalised to sum 1.
+
+Lenia, the Orbium parameters (R = 13, mu = 0.15, sigma = 0.015, dt = 0.1) and the ring kernel shell exp(4 - 1/(r(1-r))):
+Bert Wang-Chak Chan, "Lenia: Biology of Artificial Life", Complex Systems 28(3), 2019, arXiv:1812.05433.
 """
 import argparse, sys, time
 from pathlib import Path
@@ -247,7 +250,7 @@ def reference_step(world, k, P):
 
 def check():
     from aie.utils.compile import remarks
-    d = Path(".remarks/rem_lenia"); d.mkdir(parents=True, exist_ok=True)
+    d = Path(__file__).resolve().parent.parent / ".remarks" / ("rem_lenia"); d.mkdir(parents=True, exist_ok=True)
     for ef in (ext_row(),):
         rep, why = remarks.analyze(ef, "aie2p", d)
         if rep is None:

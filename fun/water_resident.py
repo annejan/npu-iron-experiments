@@ -2,7 +2,7 @@
 """The resident-world probe: the ripple tank's state lives in each core's L1 across dispatches. Per call the host
 sends one 32-int command (drop x, y, amplitude) and reads the height field back; the world never goes to DDR.
 
-  ../env.sh python fun/water_resident.py        compare with water.py (bit-identical?), time per call, autosuspend test
+  ./env.sh python fun/water_resident.py        compare with water.py (bit-identical?), time per call, autosuspend test
 
 Mechanism: `Buffer`s for the two band buffers (h and v rows, int16 Q12) per Worker, Workers in their default
 `while_true` loop where one loop iteration is one dispatch: the iteration starts by acquiring the command object

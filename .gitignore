@@ -2,6 +2,7 @@
 ironenv/
 mlir-aie/
 __pycache__/
+.remarks/
 .ruff_cache/
 # rendered outputs
 *.png

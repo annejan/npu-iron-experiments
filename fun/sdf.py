@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """Sphere-traced signed distance field at 1080p on all 32 AIE cores.
 
-  ../env.sh python fun/sdf.py --check      compile the kernel statically, print loop IIs / errors
-  ../env.sh python fun/sdf.py              bench, write sdf.png
-  ../env.sh python fun/sdf.py --window     pygame window
+  ./env.sh python fun/sdf.py --check      compile the kernel statically, print loop IIs / errors
+  ./env.sh python fun/sdf.py              bench, write sdf.png
+  ./env.sh python fun/sdf.py --window     pygame window
 
 Why this fits the NPU: every lane runs the same branchless op sequence, no memory lookups, pure ALU.
 Numerics: ray positions live in fp32 accumulators (fp32 add is native); every multiply is bf16 x bf16
 into an fp32 accumulator (native MAC); length uses bf16 invsqrt; min/max/select in bf16.
 Scene: infinite grid of spheres (domain repetition via round(p/4)*4 with the magic-number trick,
 fp32 adds only) over a floor plane, lambert shading, depth fog. STEPS fixed steps, no early exit.
+
+Domain repetition and the distance functions after Inigo Quilez (iquilezles.org/articles/distfunctions); sphere tracing:
+J. C. Hart, "Sphere tracing", The Visual Computer 12:527-545, 1996.
 """
 import argparse, sys, time
 from pathlib import Path
@@ -226,7 +229,7 @@ class SDF:
 
 def check(steps):
     from aie.utils.compile import remarks
-    d = Path(".remarks/rem_sdf")
+    d = Path(__file__).resolve().parent.parent / ".remarks" / ("rem_sdf")
     d.mkdir(parents=True, exist_ok=True)
     rep, why = remarks.analyze(ext(steps), "aie2p", d)
     if rep is None:

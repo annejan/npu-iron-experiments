@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Game of Life on 32 NPU cores, in a window.
 
-  ../env.sh python life_window.py              1024x768 world
-  ../env.sh python life_window.py --size 1536 512
+  ./env.sh python fun/life_window.py              1024x768 world
+  ./env.sh python fun/life_window.py --size 1536 512
 
   mouse left / right   draw / erase cells
   space                pause, s = one step while paused

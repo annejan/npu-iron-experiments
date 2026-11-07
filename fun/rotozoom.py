@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Rotozoomer and tunnel at 1080p on all 32 AIE cores: texture gathers on the scalar units.
 
-  ../env.sh python fun/rotozoom.py                     bench both effects, write rotozoom.png / tunnel.png
-  ../env.sh python fun/rotozoom.py --window            pygame window, TAB switches effect, ESC quits
+  ./env.sh python fun/rotozoom.py                     bench both effects, write rotozoom.png / tunnel.png
+  ./env.sh python fun/rotozoom.py --window            pygame window, TAB switches effect, ESC quits
 
 There is no per-lane vector gather on AIE, so a texture lookup is a scalar load. A 1080p frame is
 2M pixels / 32 cores = 65k pixels per core, a few cycles each: well under a millisecond.

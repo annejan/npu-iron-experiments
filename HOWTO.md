@@ -1,18 +1,19 @@
 # How to add an experiment here (for humans and agents)
 
-Read `README.md` first: hardware, measured ceilings, and every trap we hit. This file is the
-recipe.
+This is the brief we hand Claude Code (the AI agent that wrote most of `fun/` and `probe/`) before
+it adds an experiment; it works as well for people. Read `README.md` first: hardware, measured
+ceilings, and every trap we hit. This file is the recipe.
 
 ## Running
 
 ```
-cd ~/Projects/npu/iron                     # always from here
-./env.sh python fun/<script>.py ...        # relative path! (env.sh quirk, see README)
+cd <your clone>                            # every command runs from the repo root
+./env.sh python fun/<script>.py ...
 ./env.sh python -c "..."                   # ad-hoc
 ```
-`realpath: ... No such file` printed by env.sh is harmless. Never `python -I`. The NPU is one
-device: run one NPU job at a time (a second process waits or breaks timings). No pygame windows
-in unattended runs: write PNG (cv2.imwrite) or WAV (soundfile) outputs instead.
+Never `python -I` (drops PYTHONPATH and with it pyxrt). The NPU is one device: run one NPU job at
+a time (a second process waits or breaks timings). No pygame windows in unattended runs: write PNG
+(cv2.imwrite) or WAV (soundfile) outputs instead.
 
 ## Templates (copy the closest one)
 
@@ -21,7 +22,7 @@ in unattended runs: write PNG (cv2.imwrite) or WAV (soundfile) outputs instead.
 | per-row frame output, params in | `probe/plasma.py`, `fun/sdf.py` | 32 cores x 34 rows of a 1920x1088 RGBA frame; memtile join of 4 rows; one `In` of parameters broadcast per column |
 | on-chip stencil world, N steps per dispatch | `fun/slime.py`, `fun/water.py`, `fun/life_chip.py` | world in L1 (~48 KB per core usable), halo rows through shared memory in a snake of 32 cores, ping-pong buffers |
 | DDR world streamed through the cores every step | `fun/lbm.py` | 3-D shim DMA access pattern gathers each core's band plus halo rows; `acquire(3)` sliding window |
-| batch of independent jobs per core | `fun/reverb.py` (FIR), `fun/fft.py` (design only, kernel compiled out) | memtile split in / join out; `sliding_mac<32,8>` FIR |
+| batch of independent jobs per core | `fun/reverb.py` (FIR), `fun/fft.py` (design kept as the attempt; its kernel does not compile on AIE2P/Peano) | memtile split in / join out; `sliding_mac<32,8>` FIR |
 | per-element over big tensors | `fun/mandel.py` | memtile split/join of TILE-sized objects, 32 cores |
 
 ## Checklist before you call it done
@@ -52,7 +53,7 @@ in unattended runs: write PNG (cv2.imwrite) or WAV (soundfile) outputs instead.
    in 100 ms; a numpy emulation with exact rounding proved it was the format). Counters, height
    fields, wave equations: int32 fixed point. Store deviations from a rest value when you must use
    bf16 (LBM).
-10. **Deliver:** the script in `fun/` with a docstring (what, how, how to run), a row in the
-   README measured table, a short README section with the lessons, output files (`*.png`,
-   `*.wav`, gitignored), and a commit (`Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`
-   trailer, no session links).
+10. **Deliver:** the script in `fun/` with a docstring (what, how, how to run, references), a row
+   in the README measured table, a short README section with the lessons, output files (`*.png`,
+   `*.wav`, gitignored), and a commit. If an AI agent wrote part of the change, say so with a
+   `Co-Authored-By` trailer; never put chat or session links in a commit message.
