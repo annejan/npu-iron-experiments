@@ -522,8 +522,8 @@ the 49 signal nets at 0.3 mm cells; the Edge.Cuts star is the routable region): 
 | ![star](docs/img/physarum_hackerhotel2027.gif) | ![star copper](docs/img/physarum_hackerhotel2027_copper.png) 25201 segments, 206 vias; red F.Cu (the matrix is the original), blue B.Cu |
 
 And [Kami](https://github.com/Nicolai-Electronics/kami-hardware) (the SHA2017 badge re-imagined, 4 layers, 443
-pads; 72 signal nets at 0.2 mm cells, the 1564 power tracks and vias of the hand routing kept as obstacles):
-65/72, 25 minutes (long nets on a 95 x 88 mm board keep big regions of interest; the solves dominate).
+pads; 72 signal nets at 0.2 mm cells, the 737 power tracks and vias of the hand routing kept as obstacles):
+72/72, 80 vias, 16 minutes (long nets on a 95 x 88 mm board keep big regions of interest; the solves dominate).
 
 | | |
 |---|---|
