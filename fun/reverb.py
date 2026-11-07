@@ -3,7 +3,8 @@
 
   ../env.sh python fun/reverb.py in.wav                 offline: NPU vs numpy FFT convolution, writes in.reverb.wav
   ../env.sh python fun/reverb.py in.wav --play          live: block by block through the NPU into the speakers
-  ../env.sh python fun/reverb.py in.wav --ir hall.wav   use a real impulse response (first channel, resampled? no: same rate)
+  ../env.sh python fun/reverb.py in.wav --ir hall.wav   use a real impulse response (first channel, same sample rate as the audio)
+  ../env.sh python fun/reverb.py --live [--seconds 30]  microphone in -> NPU reverb -> headphones (an effect pedal; use headphones, speakers feed back)
 
 Direct-form FIR, int16 Q15 samples and taps, 32-bit partial sums. Core k owns taps [kT, (k+1)T) of the IR;
 per block of B outputs it gets a window of B+T-1 input samples plus its (reversed) tap segment, multiplies
@@ -210,7 +211,8 @@ def reference(x, h):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("wav")
+    ap.add_argument("wav", nargs="?")
+    ap.add_argument("--live", action="store_true")
     ap.add_argument("--ir")
     ap.add_argument("--play", action="store_true")
     ap.add_argument("--wet", type=float, default=0.6)
@@ -218,6 +220,27 @@ def main():
     ap.add_argument("--kernel", choices=tuple(SOURCES), default="sliding")
     a = ap.parse_args()
     import soundfile as sf
+    if a.live:
+        import sounddevice as sd
+        fs = 48000
+        ir = sf.read(a.ir, dtype="float64", always_2d=True)[0][:, 0] if a.ir else synth_ir(fs)
+        rv = Reverb(ir, a.kernel)
+        rv.feed(np.zeros(B)); rv.hist[:] = 0
+        stats = []
+
+        def cb(indata, outdata, frames, tinfo, status):
+            t0 = time.perf_counter()
+            wet = rv.feed(indata[:, 0])
+            y = np.clip((1 - a.wet) * indata[:, 0] + a.wet * 3 * wet, -1, 1)
+            outdata[:, 0] = y; outdata[:, 1] = y
+            stats.append(((time.perf_counter() - t0) * 1e3, rv.npu_ms))
+
+        with sd.Stream(samplerate=fs, channels=(1, 2), blocksize=B, dtype="float32", callback=cb) as st:
+            print(f"live: {B} samples per block = {1e3 * B / fs:.0f} ms, IR {L / fs:.2f} s; running {a.seconds or 30:.0f} s")
+            time.sleep(a.seconds or 30)
+        st_ = np.array(stats[1:])
+        print(f"{len(stats)} blocks: callback med {np.median(st_[:, 0]):.2f} ms (NPU {np.median(st_[:, 1]):.2f}) of {1e3 * B / fs:.1f} ms")
+        return
     x, fs = sf.read(a.wav, dtype="float32", always_2d=True)
     if a.seconds:
         x = x[:int(a.seconds * fs)]
