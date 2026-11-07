@@ -482,9 +482,7 @@ contested nets regrow around the others, with the crowding they met kept as a hi
 `--write-pcb` traces every tube down its pressure gradient from pad to pad, smooths the polyline (Chaikin) and
 writes it as `segment`s and `via`s into a copy of the board, which KiCad 10 opens as is: the second picture
 is KiCad's own 3D render of that file (press B in KiCad first: the zone fills in the file are the old ones).
-17/20 nets connected, 7 s on the CPU for 160 steps; the three others have a pad that no 0.2 mm track can leave
-at this grid (a switch pad between GND copper, two header pins next to kept tracks: `--cell 0.1` frees one).
-DRC is not clean, and will not be: neighbouring pins' tubes run side by side one cell apart (D+/D-, A0/A1
+20/20 nets connected, 10 s on the CPU for 160 steps. DRC is not clean, and will not be: neighbouring pins' tubes run side by side one cell apart (D+/D-, A0/A1
 ...), which with 0.2 mm tracks is a short; the crowding term keeps tubes a pitch apart only statistically,
 and `--walls` (ripped-up nets regrow with the other tubes as hard walls) trades those shorts for nets that
 cannot connect at all. Obstacles are modelled honestly (pads plus clearance plus half a track, the kept nets'
@@ -540,7 +538,11 @@ Three more lessons from the three badges, each a wrong picture or a net that gav
   pad whose only exit crossed the crowd;
 * **the board is its Edge.Cuts outline**, not its box: lines, arcs, rects, circles and polygons, also inside
   footprints (the egg is a footprint), chained into loops; the largest is the board, the others cutouts. Before
-  that the star's tubes swung outside the star.
+  that the star's tubes swung outside the star;
+* **KiCad 9 files name nets by number in tracks** (`(net 12)`, with a `(net 12 "name")` table at the top);
+  KiCad 10 writes the name everywhere. Without the table every track of a KiCad 9 board counted as a foreign
+  net: all of Kami's 983 segments were obstacles and none of the routed nets' old copper was ripped. With it,
+  usb_mini_io went from 17/20 to 20/20 and from 1.8 to 0.5 vias per net.
 
 Honest view: this is a global estimate with a drawing, not a DRC-clean router (obstacles: pads with their
 clearance, the board box, the kept nets' tracks and vias; zones and inner layers are ignored), and the NPU plays

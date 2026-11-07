@@ -662,13 +662,28 @@ def keepouts(text):
     return out
 
 
+def net_table(text):
+    """KiCad <= 9 lists `(net N "name")` at the top level and refers to nets by number in tracks; KiCad 10
+    writes the name everywhere and has no table. {code: name}, empty for KiCad 10 files."""
+    return {int(m.group(1)): m.group(2) for m in re.finditer(r'^\t\(net (\d+) "((?:[^"\\]|\\.)*)"\)', text, re.M)}
+
+
+def item_net(body, table):
+    """The net name of a track/via body: `(net "name")` or `(net N)` through the table."""
+    m = re.search(r'\(net "((?:[^"\\]|\\.)*)"\)', body)
+    if m:
+        return m.group(1)
+    m = re.search(r"\(net (\d+)\)", body)
+    return table.get(int(m.group(1))) if m else None
+
+
 def kept_copper(text, routed):
     """Top-level segments and vias of nets that are not routed: [(kind, layer 0/1, points, width)]."""
     out = []
+    table = net_table(text)
     for m in re.finditer(r"^\t\((segment|via)\n(.*?)^\t\)\n", text, re.M | re.S):
         kind, body = m.group(1), m.group(2)
-        net = re.search(r'\(net "((?:[^"\\]|\\.)*)"\)', body)
-        if net and net.group(1) in routed:
+        if item_net(body, table) in routed:
             continue
         if kind == "segment":
             st = re.search(r"\(start ([-\d.]+) ([-\d.]+)\)", body); en = re.search(r"\(end ([-\d.]+) ([-\d.]+)\)", body)
@@ -912,6 +927,8 @@ def write_pcb(pcb, out, sim, names, origin, cell, width, via, rip=True):
     import uuid
     text = Path(pcb).read_text()
     routed = set(names)
+    table = net_table(text)
+    code_of = {v: k for k, v in table.items()}                 # KiCad <= 9: write nets by number
     if rip:
         # drop top-level (segment|arc|via ...) blocks of the routed nets
         out_parts, pos = [], 0
@@ -921,8 +938,7 @@ def write_pcb(pcb, out, sim, names, origin, cell, width, via, rip=True):
                 continue
             end = text.index("\n\t)\n", start) + 4
             block = text[start:end]
-            mm = re.search(r'\(net "((?:[^"\\]|\\.)*)"\)', block)
-            if mm and mm.group(1) in routed:
+            if item_net(block, table) in routed:
                 out_parts.append(text[pos:start]); pos = end
         out_parts.append(text[pos:]); text = "".join(out_parts)
     x0, y0 = origin
@@ -930,6 +946,7 @@ def write_pcb(pcb, out, sim, names, origin, cell, width, via, rip=True):
     items = []; nseg = nvia = 0
     for i, net in enumerate(sim.nets):
         name = names[i].replace("\\", "\\\\").replace('"', '\\"')
+        netref = str(code_of[names[i]]) if names[i] in code_of else f'"{name}"'
         yb, _, xb, _ = net.box
         centres = {}                                              # terminal cell -> its pad centre (mm)
         for l, ys, xs in net.groups:
@@ -962,11 +979,11 @@ def write_pcb(pcb, out, sim, names, origin, cell, width, via, rip=True):
         for kind, l, ax, ay, bx, by in items:
             if kind == 0:
                 text_item = (f'\t(segment\n\t\t(start {ax:.4f} {ay:.4f})\n\t\t(end {bx:.4f} {by:.4f})\n\t\t(width {width})\n'
-                             f'\t\t(layer "{layers[l]}")\n\t\t(net "{name}")\n\t\t(uuid "{uuid.uuid4()}")\n\t)\n')
+                             f'\t\t(layer "{layers[l]}")\n\t\t(net {netref})\n\t\t(uuid "{uuid.uuid4()}")\n\t)\n')
                 nseg += 1
             else:
                 text_item = (f'\t(via\n\t\t(at {ax:.4f} {ay:.4f})\n\t\t(size {via[0]})\n\t\t(drill {via[1]})\n'
-                             f'\t\t(layers "F.Cu" "B.Cu")\n\t\t(net "{name}")\n\t\t(uuid "{uuid.uuid4()}")\n\t)\n')
+                             f'\t\t(layers "F.Cu" "B.Cu")\n\t\t(net {netref})\n\t\t(uuid "{uuid.uuid4()}")\n\t)\n')
                 nvia += 1
             text = text[:text.rstrip().rfind(")")] + text_item + ")\n"
         items = []
