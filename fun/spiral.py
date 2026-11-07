@@ -148,7 +148,11 @@ class CA:
         self.n = RULES[rule]["n"]
         rng = np.random.default_rng(seed)
         self.s = rng.integers(0, self.n, (self.H, W)).astype(np.int16)
-        # both rules start from uniform random states: the defects in the noise become the spiral cores
+        if rule == "gh":
+            # a broken wavefront: half a column excited with a refractory column behind it; the free end curls into a spiral
+            self.s[:] = 0
+            self.s[:self.H // 2, 100] = 1; self.s[:self.H // 2, 99] = 2
+            self.s[self.H // 2:, 350] = 1; self.s[self.H // 2:, 351] = 2
         n = self.cores * ROWS * S
         self._in = iron.zeros((n,), dtype=np.int16, device="npu")
         self._out = iron.zeros((n,), dtype=np.int16, device="npu")
