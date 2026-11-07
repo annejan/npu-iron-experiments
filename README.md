@@ -167,6 +167,7 @@ Batch work per dispatch; keep one call per frame.
 | `fft.py` | the attempt at a batched FFT; kept as a design, its kernel does not compile on AIE2P/Peano (see the FFT section) |
 | `patterns.py` | RLE helper with the classic Life objects for `life_window.py` (no main) |
 | `probe/plasma.py` | 3-sine plasma, `--window` |
+| `physarum_route.py` | slime-mould router for KiCad boards (Tero's Physarum solver, every net a tube network competing for space); `--window` / `--video` show the tubes grow, `--write-pcb` writes the tubes as tracks and vias into a copy of the board (opens in KiCad), `--write-pro` writes topor priority net classes. CPU only (sparse direct solves), see the section |
 
 ## Probes (`probe/`)
 
@@ -459,6 +460,60 @@ power, and because it is a third engine running alongside CPU and GPU. Its demo 
 upscale, denoise, style the GPU's frame; generate audio; run an LLM next to the demo
 ([FastFlowLM](https://github.com/FastFlowLM/FastFlowLM) is a separate NPU runtime for this chip).
 
+## Physarum router for KiCad (slime mould, the real one)
+
+![usb_mini_io](docs/img/physarum_usb_mini_io.gif)
+
+![usb_mini_io in KiCad](docs/img/physarum_usb_mini_io_kicad.png)
+
+`fun/physarum_route.py board.kicad_pcb --video out.mp4 --write-pcb`: Tero, Kobayashi and Nakagaki's Physarum solver
+(J. Theor. Biol. 2007; the Tokyo-rail version Science 2010) on a KiCad board. The board's two outer layers
+are a grid (cell = longest side / 250, 0.2-0.5 mm); every net is a slime mould: a conductance field D (tube
+thickness) on the free cells, a pressure field p, one pad the sink (p = 0), the other pads injecting unit flow,
+div(D grad p) = s, the flow through each cell q feeds back as dD/dt = q^1.5 - D. Tubes that carry flow fatten,
+idle ones vanish and are pruned from the system; the net converges to a shortest tree between its pads (octile
+metric: 8 neighbours, diagonals cost sqrt 2; vias are the edges between the layers, priced as a few mm of
+track). Nets compete: where other nets' flow exceeds the cell's track capacity a net's tubes are damped
+(exp(-kappa x excess), with a random per-net willingness to yield so two equal nets do not stay tied).
+The pictures above are the usb_mini_io board (20 signal nets, 0.2 mm cells; power nets and their hand-routed
+tracks are kept and are obstacles): the plasmodium spreads over the whole reachable region in the first step,
+lens-shaped flows form, and by step 25 every net is one crisp tube. Then three rounds of rip-up: the most
+contested nets regrow around the others, with the crowding they met kept as a history (PathFinder's trick).
+`--write-pcb` traces every tube down its pressure gradient from pad to pad, smooths the polyline (Chaikin) and
+writes it as `segment`s and `via`s into a copy of the board, which KiCad 10 opens as is: the second picture
+is KiCad's own 3D render of that file (press B in KiCad first: the zone fills in the file are the old ones).
+17/20 nets connected, 7 s on the CPU for 160 steps; the three others have a pad that no 0.2 mm track can leave
+at this grid (a switch pad between GND copper, two header pins next to kept tracks: `--cell 0.1` frees one).
+DRC is not clean, and will not be: neighbouring pins' tubes run side by side one cell apart (D+/D-, A0/A1
+...), which with 0.2 mm tracks is a short; the crowding term keeps tubes a pitch apart only statistically,
+and `--walls` (ripped-up nets regrow with the other tubes as hard walls) trades those shorts for nets that
+cannot connect at all. Obstacles are modelled honestly (pads plus clearance plus half a track, the kept nets'
+tracks and vias the same way), so what remains is tube-versus-tube geometry. The tubes are a topology; the
+geometry is a real router's job (topor).
+
+What came out of a day of making it converge, each one a wrong picture:
+* **the pressure solve must be exact.** A few relaxation sweeps per step (SOR, even conjugate gradients) stall
+  once tubes form: the system is stiff (1 : 10^-3 conductances) and a half-converged p gives spread flows that
+  keep the tubes spread. Per net, one sparse direct solve per step (`scipy.sparse.linalg.splu`); pruning dead
+  cells keeps it small (a 20-net board: 200k active cells at step 1, 2k at step 25);
+* **the sources must stay put.** Alternating source and sink (or Tero's random pairs) with a warm-started
+  iterative solve never converges; with direct solves the sink rotates among the pads every 20 steps;
+* **mu > 1, dt 0.7.** With mu = 1 the flow spreads over the many equal-length octile paths; with
+  normalised D and a floor the feedback died (q^mu below the floor everywhere); the absolute model with
+  dt = 0.7 converges in ~25 steps;
+* **pads of one net that overlap in the raster are one terminal** (USB-C A6/B6, stacked pads): as two
+  terminals the source feeds the sink directly and half the flow is "lost" (arrival 0.5);
+* a pad's clearance ring blocks other nets only; two rings overlapping block everyone (the gap between
+  fine-pitch pads).
+
+Honest view: this is a global estimate with a drawing, not a DRC-clean router (obstacles: pads with their
+clearance, the board box, the kept nets' tracks and vias; zones and inner layers are ignored), and the NPU plays
+no part: a sparse direct solve is the opposite of a stencil. The physics gives order-free simultaneous routing
+with congestion feedback, which is what topor's PathFinder loop also does. What it is good for: the animation,
+the organic look, and `--write-pro`: per net the flow-weighted length, its stretch over the straight
+pad-to-pad distance and how much competition it meets along the way, binned into `topor_p1..p3` net classes
+(`netclass_assignments` in a copy of the project file) for topor's routing order.
+
 ## Credits and licences
 
 * The code in this repository is MIT (`LICENSE`), Copyright 2026 Anne Jan Brouwer. It was written
@@ -483,7 +538,8 @@ upscale, denoise, style the GPU's frame; generate audio; run an LLM next to the 
   K. D. Martin, "HRTF Measurements of a KEMAR Dummy-Head Microphone", MIT Media Lab Perceptual
   Computing TR 280 (https://sound.media.mit.edu/resources/KEMAR.html); downloaded on first run,
   not redistributed.
-* Algorithms are cited in each script's docstring: Lenia (Chan 2019), Physarum agents (Jones 2010),
+* Algorithms are cited in each script's docstring: Lenia (Chan 2019), Physarum agents (Jones 2010), the
+  Physarum solver (Tero, Kobayashi, Nakagaki 2007; Tero et al. 2010),
   the Gordon-Smith "magic circle" oscillator, Visscher's scheme, Gray-Scott/Pearson, Onsager and
   Yang, Greenberg-Hastings and Griffeath's cyclic CA, Bak-Tang-Wiesenfeld, Quilez's SDF articles
   and Hart's sphere tracing, Karplus-Strong, LifeWiki's pattern catalogue.
