@@ -71,7 +71,33 @@ class Board:
         root = sexp(text)
         self.pads = []               # (net, x, y, w, h, rot_deg, front, back)
         self.nets = {}               # name -> [pad index]
+        self.edges = []              # Edge.Cuts polylines in board mm: lists of (x, y); closed ones repeat the first point
         xs, ys = [], []
+
+        def edge_item(item, tf=lambda x, y: (x, y)):
+            """One gr_*/fp_* graphic on Edge.Cuts -> polyline(s) through `tf` (footprint frame -> board)."""
+            k = item[0].split("_", 1)[1]
+            g = lambda key: child(item, key)
+            if k == "line":
+                a, b = g("start"), g("end")
+                self.edges.append([tf(float(a[1]), float(a[2])), tf(float(b[1]), float(b[2]))])
+            elif k == "rect":
+                a, b = g("start"), g("end"); x0_, y0_, x1_, y1_ = float(a[1]), float(a[2]), float(b[1]), float(b[2])
+                self.edges.append([tf(x0_, y0_), tf(x1_, y0_), tf(x1_, y1_), tf(x0_, y1_), tf(x0_, y0_)])
+            elif k == "circle":
+                c, e = g("center"), g("end"); cx_, cy_ = float(c[1]), float(c[2]); r = np.hypot(float(e[1]) - cx_, float(e[2]) - cy_)
+                self.edges.append([tf(cx_ + r * np.cos(t), cy_ + r * np.sin(t)) for t in np.linspace(0, 2 * np.pi, 48)])
+            elif k == "arc":
+                a, m, b = g("start"), g("mid"), g("end")
+                pts = arc_points((float(a[1]), float(a[2])), (float(m[1]), float(m[2])), (float(b[1]), float(b[2])))
+                self.edges.append([tf(x, y) for x, y in pts])
+            elif k == "poly":
+                pts = child(item, "pts")
+                if pts:
+                    pl = [tf(float(xy[1]), float(xy[2])) for xy in children(pts, "xy")]
+                    if pl:
+                        self.edges.append(pl + [pl[0]])
+
         for item in root[1:]:
             if not isinstance(item, list):
                 continue
@@ -80,6 +106,10 @@ class Board:
                 at = child(item, "at"); fx, fy = float(at[1]), float(at[2]); frot = float(at[3]) if len(at) > 3 else 0.0
                 flayer = child(item, "layer")[1]
                 cr, sr = np.cos(np.radians(frot)), np.sin(np.radians(frot))
+                for gi in item[1:]:
+                    if isinstance(gi, list) and gi and gi[0] in ("fp_line", "fp_arc", "fp_rect", "fp_circle", "fp_poly") \
+                            and child(gi, "layer") and child(gi, "layer")[1] == "Edge.Cuts":
+                        edge_item(gi, lambda x, y, fx=fx, fy=fy, cr=cr, sr=sr: (fx + x * cr + y * sr, fy - x * sr + y * cr))
                 for pad in children(item, "pad"):
                     kind = pad[2]
                     pat = child(pad, "at"); dx, dy = float(pat[1]), float(pat[2]); prot = float(pat[3]) if len(pat) > 3 else frot
@@ -101,6 +131,7 @@ class Board:
                     if name:
                         self.nets.setdefault(name, []).append(len(self.pads) - 1)
             elif k in ("gr_line", "gr_arc", "gr_rect", "gr_circle", "gr_poly") and child(item, "layer") and child(item, "layer")[1] == "Edge.Cuts":
+                edge_item(item)
                 for key in ("start", "end", "mid", "center"):
                     c = child(item, key)
                     if c:
@@ -113,11 +144,67 @@ class Board:
                     c, e = child(item, "center"), child(item, "end")
                     r = np.hypot(float(e[1]) - float(c[1]), float(e[2]) - float(c[2]))
                     xs += [float(c[1]) - r, float(c[1]) + r]; ys += [float(c[2]) - r, float(c[2]) + r]
-        # Edge.Cuts may live inside footprints (outline parts) and be incomplete at the top level: take the union
-        # with the pads' extent plus a margin
+        for pl in self.edges:
+            xs += [q[0] for q in pl]; ys += [q[1] for q in pl]
+        # the box is the union with the pads' extent plus a margin (an outline can be incomplete)
         px = [p[1] for p in self.pads]; py = [p[2] for p in self.pads]
         xs += [min(px) - 3, max(px) + 3]; ys += [min(py) - 3, max(py) + 3]
         self.box = (min(xs), min(ys), max(xs), max(ys))
+        self.loops = join_loops(self.edges)
+
+
+def arc_points(a, m, b, step=0.4):
+    """Points along the circular arc from a through m to b (KiCad gr_arc), about `step` mm apart."""
+    ax, ay = a; mx, my = m; bx, by = b
+    d = 2 * (ax * (my - by) + mx * (by - ay) + bx * (ay - my))
+    if abs(d) < 1e-9:
+        return [a, m, b]
+    ux = ((ax * ax + ay * ay) * (my - by) + (mx * mx + my * my) * (by - ay) + (bx * bx + by * by) * (ay - my)) / d
+    uy = ((ax * ax + ay * ay) * (bx - mx) + (mx * mx + my * my) * (ax - bx) + (bx * bx + by * by) * (mx - ax)) / d
+    r = np.hypot(ax - ux, ay - uy)
+    ta, tm, tb = (np.arctan2(y - uy, x - ux) for x, y in (a, m, b))
+    # go from ta to tb in the direction that passes tm
+    def span(t0, t1, ccw):
+        d_ = (t1 - t0) % (2 * np.pi)
+        return d_ if ccw else d_ - 2 * np.pi
+    ccw = (span(ta, tm, True) < span(ta, tb, True))
+    total = span(ta, tb, ccw)
+    n = max(3, int(abs(total) * r / step) + 1)
+    return [(ux + r * np.cos(ta + total * i / n), uy + r * np.sin(ta + total * i / n)) for i in range(n + 1)]
+
+
+def join_loops(polylines, tol=0.05):
+    """Chain open polylines end to end into closed loops (endpoints within `tol` mm); returns the closed ones."""
+    loops, open_ = [], []
+    for pl in polylines:
+        if len(pl) >= 4 and np.hypot(pl[0][0] - pl[-1][0], pl[0][1] - pl[-1][1]) <= tol:
+            loops.append(pl)
+        else:
+            open_.append(list(pl))
+    while open_:
+        cur = open_.pop(0)
+        for _ in range(len(open_) + 2):
+            ex, ey = cur[-1]
+            if np.hypot(cur[0][0] - ex, cur[0][1] - ey) <= tol and len(cur) >= 4:
+                loops.append(cur); cur = None; break
+            hit = None
+            for j, o in enumerate(open_):
+                if np.hypot(o[0][0] - ex, o[0][1] - ey) <= tol:
+                    hit = (j, o)
+                elif np.hypot(o[-1][0] - ex, o[-1][1] - ey) <= tol:
+                    hit = (j, o[::-1])
+                if hit:
+                    break
+            if not hit:
+                break
+            open_.pop(hit[0]); cur = cur + hit[1][1:]
+        # unclosed chains are dropped
+    return loops
+
+
+def polygon_area(pl):
+    x = np.array([q[0] for q in pl]); y = np.array([q[1] for q in pl])
+    return 0.5 * abs(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1)))
 
 
 def project_rules(pcb):
@@ -231,6 +318,20 @@ def rasterize(board, names, cell, clearance, width=0.2, copper=(), keep=()):
                     (ax, ay), = pts
                     cv2.circle(mh, (int(round((ax - x0) / cell)), int(round((ay - y0) / cell))), r, 1, -1)
             owner[l][(mh > 0) & (owner[l] < 0)] = -2
+    if board.loops:
+        import cv2
+        loops = sorted(board.loops, key=polygon_area, reverse=True)
+        inside = np.zeros((H, W), np.uint8)
+        to_px = lambda pl: np.array([[int(round((x - x0) / cell)), int(round((y - y0) / cell))] for x, y in pl], np.int32)
+        cv2.fillPoly(inside, [to_px(loops[0])], 1)
+        for pl in loops[1:]:
+            if polygon_area(pl) < 0.9 * polygon_area(loops[0]):
+                cv2.fillPoly(inside, [to_px(pl)], 0)          # a cutout
+        band = max(1, int(round((clearance + width / 2) / cell)))
+        for pl in loops:
+            cv2.polylines(inside, [to_px(pl)], True, 0, 2 * band + 1)
+        for l in (0, 1):
+            owner[l][(inside == 0) & (owner[l] < 0)] = -2
     if keep:
         import cv2
         for layers, pts in keep:
