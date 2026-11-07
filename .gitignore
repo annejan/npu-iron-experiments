@@ -1,0 +1,8 @@
+# toolchain + upstream checkout (see setup.sh; mlir-aie is Xilinx/mlir-aie v1.4.5)
+ironenv/
+mlir-aie/
+__pycache__/
+.ruff_cache/
+# rendered outputs
+*.png
+*.wav
