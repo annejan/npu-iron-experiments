@@ -133,7 +133,7 @@ def project_rules(pcb):
 
 
 # ----------------------------------------------------------------------------------------------- raster
-def rasterize(board, names, cell, clearance, width=0.2, copper=()):
+def rasterize(board, names, cell, clearance, width=0.2, copper=(), keep=()):
     """owner[layer, y, x]: index into `names` of the pad there (own-net conductive), -1 free, -2 blocked for all.
     Two passes: every pad's clearance ring blocks free cells, then every pad's core (the cells under its copper,
     at least the cell under its centre) is painted over the rings; two cores of different nets in one cell stay
@@ -230,6 +230,15 @@ def rasterize(board, names, cell, clearance, width=0.2, copper=()):
                     (ax, ay), = pts
                     cv2.circle(mh, (int(round((ax - x0) / cell)), int(round((ay - y0) / cell))), r, 1, -1)
             owner[l][(mh > 0) & (owner[l] < 0)] = -2
+    if keep:
+        import cv2
+        for layers, pts in keep:
+            m = np.zeros((H, W), np.uint8)
+            cv2.fillPoly(m, [np.array([[int(round((x - x0) / cell)), int(round((y - y0) / cell))] for x, y in pts], np.int32)], 1)
+            cv2.polylines(m, [np.array([[int(round((x - x0) / cell)), int(round((y - y0) / cell))] for x, y in pts], np.int32)], True, 1,
+                          max(1, int(round((clearance + width / 2) / cell)) * 2 + 1))
+            for l in layers:
+                owner[l][(m > 0) & (owner[l] < 0)] = -2
     ringof[(owner == -2) | own] = -1
     ringof[ringof < -1] = -1
     return owner, ringof, (x0, y0)
@@ -510,6 +519,29 @@ class Physarum:
 
 
 # ----------------------------------------------------------------------------------------------- driver
+def keepouts(text):
+    """Zones that forbid tracks: [(layers set of 0/1, polygon [(x, y)...])], top-level or inside footprints."""
+    out = []
+    for m in re.finditer(r"^(\t+)\(zone\n(.*?)\n\1\)\n", text, re.S | re.M):   # closes at its own indentation
+        body = m.group(2)
+        if "(keepout" not in body or "(tracks not_allowed)" not in body:
+            continue
+        ly = re.search(r'\(layers? ((?:"[^"]+"\s*)+)\)', body)
+        if not ly:
+            continue
+        names = re.findall(r'"([^"]+)"', ly.group(1))
+        layers = {l for l, n in ((0, "F.Cu"), (1, "B.Cu")) if n in names or "*.Cu" in names or "F&B.Cu" in names}
+        if not layers:
+            continue
+        poly = re.search(r"\(polygon\s*\(pts(.*?)\n\s*\)", body, re.S)
+        if not poly:
+            continue
+        pts = [(float(a), float(b)) for a, b in re.findall(r"\(xy ([-\d.]+) ([-\d.]+)\)", poly.group(1))]
+        if len(pts) >= 3:
+            out.append((layers, pts))
+    return out
+
+
 def kept_copper(text, routed):
     """Top-level segments and vias of nets that are not routed: [(kind, layer 0/1, points, width)]."""
     out = []
@@ -532,8 +564,8 @@ def kept_copper(text, routed):
     return out
 
 
-def setup(board, names, cell, clearance, width=0.2, copper=()):
-    owner, ringof, origin = rasterize(board, names, cell, clearance, width, copper)
+def setup(board, names, cell, clearance, width=0.2, copper=(), keep=()):
+    owner, ringof, origin = rasterize(board, names, cell, clearance, width, copper, keep)
     net_pads, keep = [], []
     for i, n in enumerate(names):
         groups = []
@@ -833,7 +865,8 @@ def write_pro(pcb, names, tiers, out):
     for t in (1, 2, 3):
         if f"topor_p{t}" not in have:
             classes.append({"name": f"topor_p{t}", "priority": 2147483647})
-    asg = ns.setdefault("netclass_assignments", {})
+    asg = ns.get("netclass_assignments") or {}
+    ns["netclass_assignments"] = asg
     for n, t in zip(names, tiers):
         old = asg.get(n, [])
         old = old if isinstance(old, list) else [old]
@@ -890,6 +923,7 @@ def main():
     ap.add_argument("--crowd", type=float, default=1.0, help="other nets' flow tolerated within a track pitch, 0 (none) .. 1")
     ap.add_argument("--walls", action="store_true", help="ripped-up nets regrow with the other tubes as walls (fewer shorts, more failures)")
     ap.add_argument("--max-nets", type=int, default=0)
+    ap.add_argument("--max-pads", type=int, default=0, help="skip nets with more pads than this (LED matrices: hours of solves); 0 = route all")
     ap.add_argument("--skip", default="", help="extra net name regex to skip (power nets are skipped by default)")
     ap.add_argument("--route-power", action="store_true")
     ap.add_argument("--write-pro", action="store_true")
@@ -909,6 +943,8 @@ def main():
         names = [n for n in names if not POWER.match(n.rsplit("/", 1)[-1])]
     if a.skip:
         rx = re.compile(a.skip); names = [n for n in names if not rx.search(n)]
+    if a.max_pads:
+        names = [n for n in names if len(board.nets[n]) <= a.max_pads]
     names.sort(key=lambda n: -len(board.nets[n]))
     if a.max_nets:
         names = names[:a.max_nets]
@@ -918,11 +954,13 @@ def main():
     print(f"{Path(a.pcb).name}: {len(board.pads)} pads, {len(board.nets)} nets, routing {len(names)} "
           f"({sum(len(board.nets[n]) for n in names)} pads); board {x1 - x0:.0f} x {y1 - y0:.0f} mm")
     names0 = list(names)
-    copper = kept_copper(Path(a.pcb).read_text(), set(names))
-    owner, ringof, origin, names, net_pads = setup(board, names, a.cell, a.clearance, rules[1], copper)
+    text = Path(a.pcb).read_text()
+    copper = kept_copper(text, set(names)); keep = keepouts(text)
+    owner, ringof, origin, names, net_pads = setup(board, names, a.cell, a.clearance, rules[1], copper, keep)
     L, H, W = owner.shape
     print(f"grid {W} x {H} x 2 at {a.cell:.2f} mm (clearance {a.clearance} mm, track pitch {a.pitch:.3f} mm = "
-          f"{a.cell / a.pitch:.2f} tracks per cell); free {np.mean(owner == -1) * 100:.0f}%; {len(copper)} kept tracks/vias as obstacles")
+          f"{a.cell / a.pitch:.2f} tracks per cell); free {np.mean(owner == -1) * 100:.0f}%; {len(copper)} kept tracks/vias and "
+          f"{len(keep)} track keepouts as obstacles")
     sim = Physarum(owner, net_pads, via_cost=a.via_cost, cell=a.cell, pitch=a.pitch, kappa=a.kappa, mu=a.mu, seed=a.seed,
                    prune=a.prune, dt=a.dt, ringof=ringof, crowd=a.crowd, walls=a.walls)
     t0 = time.time()
