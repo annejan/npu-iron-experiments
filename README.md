@@ -164,6 +164,23 @@ picture each:
   overflowed. And subtract in int16 before converting to bf16 when the next step is a sharp
   Gaussian (sigma 0.015): bf16(u) alone has 8 mantissa bits.
 
+## The lookup unit: gathers after all (for tables)
+
+`probe/lut.py`: `aie::parallel_lookup` on a `aie::lut<4>` table (entries stored run-duplicated: runs
+of 16 x 16-bit or 8 x 32-bit values written twice, in two copies) returns 16 looked-up values per
+`fetch` of 16 indices. Applied 200 times to a 512x512 index image on all 32 cores:
+
+| table | scalar `out[x] = pal[in[x]]` | parallel_lookup |
+|---|---|---|
+| 256 x int32 (RGBA palette) | 6.6 G lookups/s | 24.5 G lookups/s |
+| 4096 x uint16 (a 64x64 RGB565 texture) | 5.2 G lookups/s | 24.6 G lookups/s |
+
+(measured with the CPU saturated by a model export, so absolute numbers are low; the ratio holds.)
+Four times the scalar unit, independent of table size, exact. Palettes, sin/cos tables, small
+textures and transfer functions belong in L1 as LUTs, not in scalar loops: the rotozoomer and
+tunnel would run about 4x faster this way. Limit: the table lives in L1 four times over
+(2 copies x 2 tables), so 4096 x 16-bit is 32 KB.
+
 ## Ising with a random number generator in the lanes
 
 `fun/ising.py`: spins as int16 on the chip (slime.py layout), one call = 20 half-sweeps; each half-sweep
