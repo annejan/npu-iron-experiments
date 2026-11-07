@@ -41,6 +41,8 @@ mlir-aie 1.4.5 (IRON) with XRT 2.26 unpacked in `../ryzenai`. `./setup.sh` once,
 | Binaural, 32 sources x 2 ears x 160 taps, 1024-sample blocks | 0.28 ms per block (dispatch-bound), bit-exact, 38x real time (`fun/binaural.py`) |
 | conv2d engine 512x512: K=3 / 7 / 15 | 0.27 / 0.35 / 0.91 ms per pass, 1-4 LSB vs numpy (`fun/conv2d.py`) |
 | Physarum 120k agents + NPU blur | 13.8 ms/step total, NPU 0.7 ms of it (the agents are the cost) (`fun/physarum.py`) |
+| Ising 512x512, 20 half-sweeps per dispatch | 2-3 G spin-updates/s (7-11k sweeps/s); |M| and E within 1% of Onsager at T = 1.5..3.5 (`fun/ising.py`) |
+| YOLO26n (stock example), whole network on 32 tiles, seeded weights, batch 1 | 11.3 ms per 640x640 image = 84 fps, bit-exact vs the integer oracle |
 | 3-D wave FDTD 32x32x128 (131k cells), int32, 1 step/dispatch | 0.21 ms/step NPU, 0.26-0.31 ms incl. host readback: 1 s of 8 kHz room response in 2.5 s (`fun/room.py`) |
 | LBM D2Q9 384x256, bf16 deviations, 1 step per dispatch (DMA-bound) | 2700 steps/s, 0.27 Gcell-steps/s (`fun/lbm.py`) |
 | Mandelbrot 1080p, 400 iterations, Q24 int32, 16 lanes, 32 cores | 26.9 ms (numpy 5.4 s; old scalar int64 kernel on 8 cores 34x slower) (`fun/mandel.py --bench`) |
@@ -66,6 +68,8 @@ Batch work per dispatch; keep one call per frame.
 | `binaural.py` | 32 sources around the head, one per core, MIT KEMAR HRTFs (downloaded to `data/kemar/`), two `sliding_mac` FIRs per core; writes `binaural_arpeggio.wav`, `--play` live |
 | `conv2d.py` | generic K x K convolution engine over a DDR world (the Lenia machinery parameterised), self-test vs numpy |
 | `physarum.py` | real slime-mould networks (Jones 2010 agents on the CPU, trail blur + decay on the NPU via conv2d) |
+| `ising.py` | 2-D Ising, checkerboard Metropolis, xorshift32 RNG in the lanes, world on chip; |M| and E vs Onsager's exact solution; `--window` (up/down: temperature) |
+| `yolo_cam.py` | YOLO26n object detection on the webcam or an image, via the stock `mlir-aie/programming_examples/ml/yolo26n` (needs its exported weights) |
 | `lbm.py` | Lattice-Boltzmann D2Q9 fluid, flow past a cylinder; world in DDR, streamed through all 32 cores every step, shim DMA gathers the halo rows with a 3-D pattern, cores use a 3-row sliding window (`acquire(3)`); `--window` (drag = obstacles, C = clear) |
 | `../probe/plasma.py` | 3-sine plasma, `--window` |
 
@@ -159,6 +163,26 @@ picture each:
 * Keep the int32 accumulator in range: sum(k) = 1 scaled by 2^16 times 32767 just fits; 2^19
   overflowed. And subtract in int16 before converting to bf16 when the next step is a sharp
   Gaussian (sigma 0.015): bf16(u) alone has 8 mantissa bits.
+
+## Ising with a random number generator in the lanes
+
+`fun/ising.py`: spins as int16 on the chip (slime.py layout), one call = 20 half-sweeps; each half-sweep
+updates one checkerboard colour with Metropolis. The random numbers are a per-core xorshift32 on two
+16-lane int32 vectors (logical right shift = arithmetic shift + mask), 15 bits per spin, state kept in
+static L1 across calls (here persistence is a feature). The flip decision is three masks: dE <= 0, or
+dE = 4 and rnd < exp(-4/T), or dE = 8 and rnd < exp(-8/T); thresholds are compile-time constants, so
+each temperature is a variant. Checked against Onsager: |M| 0.9869 vs 0.9865 at T = 1.5, 0.794 vs
+0.785 at T = 2.2 (started ordered; a quench from random needs far more than 2000 sweeps to order a
+512x512 lattice), energy within 0.3% at every T, critical clusters at Tc = 2.269 in `ising.png`.
+2-3 G spin updates per second.
+
+## YOLO26n: the stock example runs here
+
+`mlir-aie/programming_examples/ml/yolo26n` maps the whole YOLO26n detector (168 int8 operators) onto
+all 32 tiles in one dispatch. With seeded weights (`--synthetic 7`, no checkpoint) it compiles and
+runs on this Krackan: 2/2 images bit-exact against the integer oracle, **11.3 ms per image, 84 fps at
+batch 1**. `fun/yolo_cam.py` wraps it for the webcam once the real weights are exported
+(`make export` needs torch CPU, ultralytics and amd-quark, all pip-installable here).
 
 ## Physarum, the honest version
 

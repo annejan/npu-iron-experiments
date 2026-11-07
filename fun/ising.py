@@ -161,13 +161,13 @@ def ising_chip(world: In, out: Out, *, steps: CompileTime[int], cols: CompileTim
 
 
 class Ising:
-    def __init__(self, T=TC, steps=20, seed=1):
+    def __init__(self, T=TC, steps=20, seed=1, ordered=False):
         self.cols = iron.get_current_device().cols
         self.cores = self.cols * ROWS_PER_COL
         self.H = self.cores * ROWS
         self.T, self.steps = T, steps
         rng = np.random.default_rng(seed)
-        self.s = rng.choice([-1, 1], (self.H, W)).astype(np.int16)
+        self.s = np.ones((self.H, W), np.int16) if ordered else rng.choice([-1, 1], (self.H, W)).astype(np.int16)
         n = self.cores * ROWS * S
         self._in = iron.zeros((n,), dtype=np.int16, device="npu")
         self._out = iron.zeros((n,), dtype=np.int16, device="npu")
@@ -202,6 +202,17 @@ def onsager_m(T):
     return (1 - np.sinh(2 / T) ** -4) ** 0.125 if T < TC else 0.0
 
 
+def onsager_e(T):
+    """exact internal energy per spin (J = 1): -coth(2K) [1 + (2/pi)(2 tanh^2(2K) - 1) K1(k)], K1 via the AGM"""
+    K = 1 / T
+    k = 2 * np.sinh(2 * K) / np.cosh(2 * K) ** 2
+    a, b = 1.0, np.sqrt(1 - k * k)
+    for _ in range(40):
+        a, b = (a + b) / 2, np.sqrt(a * b)
+    K1 = np.pi / (2 * a)
+    return -1 / np.tanh(2 * K) * (1 + 2 / np.pi * (2 * np.tanh(2 * K) ** 2 - 1) * K1)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--window", action="store_true")
@@ -223,16 +234,17 @@ def main():
             screen.blit(font.render(f"T = {sim.T:.2f} (Tc {TC:.3f})  |M| {m:.3f} (Onsager {onsager_m(sim.T):.3f})  E {en:.3f}  {sim.steps} half-sweeps {ms:.1f} ms   up/down: T", True, (255, 60, 60)), (8, 8))
             pygame.display.flip()
     import cv2
-    print(f"{W}x{32 * ROWS} lattice, {a.sweeps} sweeps per T after a quench from random")
+    print(f"{W}x{32 * ROWS} lattice, {a.sweeps} sweeps per T (ordered start below Tc, random above: a quench needs far more sweeps to order)")
     for T in (1.5, 2.0, 2.2, TC, 2.4, 2.7, 3.5):
-        sim = Ising(T=T, steps=20)
+        sim = Ising(T=T, steps=20, ordered=T < TC)
         sim.run()
         t0 = time.perf_counter()
         calls = a.sweeps * 2 // 20
         for _ in range(calls): sim.run()
         dt = time.perf_counter() - t0
         m, en = sim.observables()
-        print(f"T = {T:.3f}: |M| = {m:.4f}  Onsager {onsager_m(T):.4f}   E/N = {en:.4f}   {calls * 20 / 2 / dt:.0f} sweeps/s ({W * 32 * ROWS * calls * 10 / dt / 1e9:.1f} Gspin-updates/s)")
+        print(f"T = {T:.3f}: |M| = {m:.4f} (Onsager {onsager_m(T):.4f})   E/N = {en:.4f} (exact {onsager_e(T):.4f})   "
+              f"{calls * 20 / 2 / dt:.0f} sweeps/s ({W * 32 * ROWS * calls * 10 / dt / 1e9:.1f} Gspin-updates/s)")
         if abs(T - TC) < 1e-6:
             cv2.imwrite("ising.png", ((sim.s + 1) * 127).astype(np.uint8))
     print("wrote ising.png (lattice at Tc)")
