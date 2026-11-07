@@ -516,6 +516,24 @@ two outer layers, power on its planes left alone), `--video --write-pcb --write-
 |---|---|
 | ![copper](docs/img/physarum_bornhack2026_copper.png) F.Cu red, B.Cu blue, zones hidden: 116/118 nets, 16672 segments, 145 vias | ![kicad](docs/img/physarum_bornhack2026_kicad.png) the file in KiCad's 3D viewer, bottom side |
 
+The HackerHotel 2027 star badge (924 pads, a 20x20 LED matrix whose nets stay as hand-routed, `--max-pads 8`;
+the 49 signal nets at 0.3 mm cells; the Edge.Cuts star is the routable region): 48/49, 7 minutes.
+
+| | |
+|---|---|
+| ![star](docs/img/physarum_hackerhotel2027.gif) | ![star copper](docs/img/physarum_hackerhotel2027_copper.png) 25201 segments, 206 vias; red F.Cu (the matrix is the original), blue B.Cu |
+
+Three more lessons from the three badges, each a wrong picture or a net that gave up:
+* **prune by flow, and never a terminal off.** Pruning by tube thickness cut far pads off: their flow starts
+  spread over dozens of cells, each too thin, and all died in one step. A cell now dies only when it carries
+  less than 1 % of one terminal's flow, and a pruning that would disconnect any pad from the sink's component is
+  reduced to the cells carrying no flow at all (one `scipy.ndimage.label` per net per step);
+* **the crowding damping needs a floor** (1e-3): `exp(-40)` next to kept copper made the matrix singular for a
+  pad whose only exit crossed the crowd;
+* **the board is its Edge.Cuts outline**, not its box: lines, arcs, rects, circles and polygons, also inside
+  footprints (the egg is a footprint), chained into loops; the largest is the board, the others cutouts. Before
+  that the star's tubes swung outside the star.
+
 Honest view: this is a global estimate with a drawing, not a DRC-clean router (obstacles: pads with their
 clearance, the board box, the kept nets' tracks and vias; zones and inner layers are ignored), and the NPU plays
 no part: a sparse direct solve is the opposite of a stencil. The physics gives order-free simultaneous routing

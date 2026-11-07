@@ -531,7 +531,15 @@ class Net:
         # cut off before the feedback could gather its flow); a cell dies only when it carries less than
         # `prune` of one terminal's flow
         dead = self.active & ~self.own & (q < self.prune / max(1, len(self.groups) - 1))
-        self.active &= ~dead
+        if dead.any():
+            # never prune a terminal off: if the pruned set would disconnect any pad from the sink's component,
+            # only the cells carrying no flow at all go (the fan of a far pad is spread thin but still its way out)
+            from scipy.ndimage import label
+            lab, _ = label(self.active & ~dead, structure=np.ones((3, 3, 3), int))
+            l0, ys0, xs0 = self.groups[0]; root = lab[l0, ys0[0], xs0[0]]
+            if any(lab[l, ys[0], xs[0]] != root for l, ys, xs in self.groups):
+                dead = self.active & ~self.own & (q < 1e-9)
+            self.active &= ~dead
         Dn[~self.active] = 0
         np.clip(Dn, 0, self.dmax, out=Dn)
         self.D = Dn
