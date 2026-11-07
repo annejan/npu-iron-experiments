@@ -16,7 +16,7 @@ mlir-aie 1.4.5 (IRON) with XRT 2.26 unpacked in `../ryzenai`. `./setup.sh` once,
 | ![Lenia](docs/img/lenia.png) Lenia, 27x27 kernel | ![Physarum](docs/img/physarum.png) Physarum network | ![Double slit](docs/img/schrodinger.png) Schrodinger double slit |
 | ![Ising](docs/img/ising.png) Ising at Tc | ![LBM](docs/img/lbm.png) Lattice-Boltzmann vortex street | ![Water](docs/img/water.png) Ripple tank |
 | ![SDF](docs/img/sdf64.png) SDF sphere tracer | ![Blobs](docs/img/blob48.png) Smooth-min blobs | ![Mandelbrot](docs/img/mandel.png) Mandelbrot, 32 cores |
-| ![Sandpile](docs/img/sandpile.png) Abelian sandpile, 2^18 grains | ![Room](docs/img/room.png) Room acoustics wavefronts | ![Plasma](docs/img/plasma.png) Plasma, 3000 fps |
+| ![Sandpile](docs/img/sandpile.png) Abelian sandpile, 2^18 grains | ![Gray-Scott](docs/img/grayscott.png) Gray-Scott coral | ![YOLO](docs/img/yolo_coco.png) YOLO26n, 150 fps, real weights |
 
 ## Hardware (xrt-smi: "NPU Krackan 1", aie2p, 6x8)
 
@@ -52,9 +52,10 @@ mlir-aie 1.4.5 (IRON) with XRT 2.26 unpacked in `../ryzenai`. `./setup.sh` once,
 | conv2d engine 512x512: K=3 / 7 / 15 | 0.27 / 0.35 / 0.91 ms per pass, 1-4 LSB vs numpy (`fun/conv2d.py`) |
 | Physarum 120k agents + NPU blur | 13.8 ms/step total, NPU 0.7 ms of it (the agents are the cost) (`fun/physarum.py`) |
 | Ising 512x512, 20 half-sweeps per dispatch | 2-3 G spin-updates/s (7-11k sweeps/s); |M| and E within 1% of Onsager at T = 1.5..3.5 (`fun/ising.py`) |
-| YOLO26n (stock example), whole network on 32 tiles, seeded weights, batch 1 | 11.3 ms per 640x640 image = 84 fps, bit-exact vs the integer oracle |
+| YOLO26n (stock example), whole network on 32 tiles, batch 1 | real XINT8 weights: **6.5 ms per 640x640 image = 150 fps**, 8/8 coco128 images bit-exact vs the oracle and ONNX Runtime, mAP50 0.97; seeded weights measured 11.3 ms with the CPU busy |
 | 2-D Schrodinger 512x512, int32, 1 step/dispatch (R for 3 rows + I for 1 per output row) | 0.47 ms/step, 2100 steps/s; norm conserved to 0.3% over 1400 steps (`fun/schrodinger.py`) |
 | Sandpile 512x512, 101 rounds/dispatch | 90k rounds/s (2^18 grains stable in 50k rounds = 0.6 s), grains conserved exactly (`fun/sandpile.py`) |
+| Gray-Scott 512x256, 101 steps/dispatch | 4300 steps/s, 0.6 Gcell-steps/s (`fun/grayscott.py`) |
 | 3-D wave FDTD 32x32x128 (131k cells), int32, 1 step/dispatch | 0.21 ms/step NPU, 0.26-0.31 ms incl. host readback: 1 s of 8 kHz room response in 2.5 s (`fun/room.py`) |
 | LBM D2Q9 384x256, bf16 deviations, 1 step per dispatch (DMA-bound) | 2700 steps/s, 0.27 Gcell-steps/s (`fun/lbm.py`) |
 | Mandelbrot 1080p, 400 iterations, Q24 int32, 16 lanes, 32 cores | 26.9 ms (numpy 5.4 s; old scalar int64 kernel on 8 cores 34x slower) (`fun/mandel.py --bench`) |
@@ -84,6 +85,7 @@ Batch work per dispatch; keep one call per frame.
 | `yolo_cam.py` | YOLO26n object detection on the webcam or an image, via the stock `mlir-aie/programming_examples/ml/yolo26n` (needs its exported weights) |
 | `schrodinger.py` | 2-D Schrodinger equation, Visscher scheme, int32 Q28, 5-row sliding window; a wave packet through a double slit; `--check` vs numpy |
 | `sandpile.py` | Abelian sandpile, exact int16 stencil on chip, 2^18 grains dropped in portions (abelian), the fractal in `sandpile.png` |
+| `grayscott.py` | Gray-Scott reaction-diffusion, int16 Q14, world on chip; `--F --k` or live keys through Pearson's map |
 | `lbm.py` | Lattice-Boltzmann D2Q9 fluid, flow past a cylinder; world in DDR, streamed through all 32 cores every step, shim DMA gathers the halo rows with a 3-D pattern, cores use a 3-row sliding window (`acquire(3)`); `--window` (drag = obstacles, C = clear) |
 | `../probe/plasma.py` | 3-sine plasma, `--window` |
 
@@ -210,10 +212,12 @@ each temperature is a variant. Checked against Onsager: |M| 0.9869 vs 0.9865 at 
 ## YOLO26n: the stock example runs here
 
 `mlir-aie/programming_examples/ml/yolo26n` maps the whole YOLO26n detector (168 int8 operators) onto
-all 32 tiles in one dispatch. With seeded weights (`--synthetic 7`, no checkpoint) it compiles and
-runs on this Krackan: 2/2 images bit-exact against the integer oracle, **11.3 ms per image, 84 fps at
-batch 1**. `fun/yolo_cam.py` wraps it for the webcam once the real weights are exported
-(`make export` needs torch CPU, ultralytics and amd-quark, all pip-installable here).
+all 32 tiles in one dispatch. On this Krackan with the real weights (`export_yolo26n.py` +
+`gen_yolo_data.py`: torch CPU, ultralytics and amd-quark pip-install fine; the quantization
+calibration takes ~25 minutes of all cores): 8/8 coco128 images bit-exact against the integer oracle
+and ONNX Runtime, mAP50 0.97 on those 8, **6.5 ms per image on the NPU, 150 fps at batch 1**.
+`fun/yolo_cam.py` adds the webcam/letterbox/drawing (`--image`, `--still`, `--window`). While the
+export was calibrating on the CPU the same network measured 11.3 ms: see the CPU-load note below.
 
 ## Physarum, the honest version
 
@@ -309,6 +313,10 @@ Read 2026-11-07, https://github.com/ghost-intuit/xdna2-npu-experiments (CC BY 4.
   figure of 630 us was a cold first run, not the mode. The paper's 1.40 GHz default was measured on
   Windows; the Linux amdxdna driver appears to run near the top clock under load already. Setting
   the mode needs root (`./pmode.sh performance|default` wraps the sudo and library path).
+* **CPU load throttles the NPU, measured here**: with a model export saturating the CPU (load 24)
+  `probe/npu_top.py` showed the H clock settling at 1150-1190 MHz under a sustained NPU load and
+  the II-1 burn implied 0.96 GHz, against ~1.7 GHz with the CPU idle; YOLO26n took 11.3 ms instead
+  of 6.5 ms. Keep the CPU quiet when timing, or when it matters.
 * **Fixed cost per call ~100 us** (89-95 us with no array activity), measured by trace; matches
   the ~160 us we see from Python. One call per frame; batch steps.
 * **Heavy CPU load slows the NPU's data movement by up to 59%** (shared power budget, lower
