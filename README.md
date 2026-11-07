@@ -120,6 +120,7 @@ stated, min or median after a warm-up call, host wall clock from Python unless t
 | Ripple tank 320x384, int16 Q12, world on chip, 5 steps/dispatch | 17k steps/s, 2.1 Gcell-steps/s (`fun/water.py`) |
 | Convolution reverb, 65536 taps, 2048-sample blocks, stereo | 0.43 ms NPU per block per channel (43 ms of audio), 308 GMAC/s in the calls; 41x real time over the whole Python loop on a stereo file, bit-exact vs FFT (`fun/reverb.py`) |
 | Lenia 512x512, 27x27 kernel (729 taps/cell), int16 Q15 | 0.65-0.84 ms/step, 1200-1500 steps/s, ~250 GMAC/s, conv exact to 6 LSB (`fun/lenia.py`) |
+| DX7 FM synth, 512 voices x 6 operators, 256-sample blocks | 0.5 ms per block (5.3 ms of audio), 1.6 G operator-samples/s, bit-exact replica (`fun/dx7.py`) |
 | Additive synth, 3072 partials, 1024-sample blocks | 0.38 ms per block (21 ms of audio: 56x real time for all 3072 partials) = 8 G partial-samples/s, amplitude drift-free, 0.03 Hz tuning (`fun/additive.py`) |
 | Binaural, 32 sources x 2 ears x 160 taps, 1024-sample blocks | 0.28 ms per block (dispatch-bound), bit-exact, 38x real time (`fun/binaural.py`) |
 | conv2d engine 512x512: K=3 / 7 / 15 | 0.27 / 0.35 / 0.91 ms per pass, 1-4 LSB vs numpy (`fun/conv2d.py`) |
@@ -166,6 +167,7 @@ Batch work per dispatch; keep one call per frame.
 | `lbm.py` | Lattice-Boltzmann D2Q9 fluid, flow past a cylinder; world in DDR, streamed through all 32 cores every step, shim DMA gathers the halo rows with a 3-D pattern, cores use a 3-row sliding window (`acquire(3)`); `--window` (drag = obstacles, C = clear) |
 | `fft.py` | the attempt at a batched FFT; kept as a design, its kernel does not compile on AIE2P/Peano (see the FFT section) |
 | `patterns.py` | RLE helper with the classic Life objects for `life_window.py` (no main) |
+| `dx7.py` | DX7-style FM synth: 512 six-operator voices, voices in the lanes, sine through the lookup unit, the 32 algorithms as data; `--window` plays it from the keyboard, bit-exact numpy replica, `dx7_demo.wav` |
 | `probe/plasma.py` | 3-sine plasma, `--window` |
 | `physarum_route.py` | slime-mould router for KiCad boards (Tero's Physarum solver, every net a tube network competing for space); `--window` / `--video` show the tubes grow, `--write-pcb` writes the tubes as tracks and vias into a copy of the board (opens in KiCad), `--write-pro` writes topor priority net classes. CPU only (sparse direct solves), see the section |
 
@@ -358,6 +360,32 @@ so e alone does not tell theta from 2 pi - theta (seed the lanes on the branch o
 and Q15 cannot hold 1.0, so "no decay" must skip the multiply (32767/32768 per sub-block is -3% in
 10 s). Demos: bells (inharmonic partial sets with per-partial decay) and a drum loop resynthesised
 from its STFT magnitudes with one partial per bin.
+
+## FM synthesis: a DX7 with the voices in the lanes
+
+![dx7](docs/img/dx7_spectrogram.png)
+
+`fun/dx7.py`: six sine operators per voice with phase accumulators (Q32 turns), frequency ratios, output levels,
+4-rate/4-level envelopes, one of the DX7's 32 algorithms (which operator modulates which, which are carriers,
+which feeds back), all after the DX7's own model with made-up patches (e-piano, bass, bells, brass, pad; Yamaha's
+are not included). The additive synth put time in the lanes; FM cannot, because the feedback operator needs the
+previous sample's output, so here the **voices are the lanes**: 16 voices per core as int32 lanes, 32 cores, 512
+voices, time is the loop. Per sample and operator: phase += increment, plus the modulators' Q15 outputs times
+their depth (wrap-around int32 arithmetic is exactly sin(x + 2 pi) = sin(x)), the top 12 bits index a 4096-entry
+sine table through the lookup unit (`aie::parallel_lookup`, one fetch for the 16 voices), times the operator's
+level (a per-sample Q31 ramp between the envelope points the host computes per 256-sample block), carriers summed,
+the 16 voices mixed with `reduce_add`. The algorithm is a per-core table (sources and depths per operator), so one
+kernel serves all 32 algorithms and a core can hold any patch. The host does envelopes (in dB, per block),
+voice allocation and the keyboard; a 256-sample block of all 512 voices x 6 operators takes 0.5 ms on the chip
+(1.6 G operator-samples/s), 5.3 ms of audio, so about 10x real time with every voice sounding, bit-exact
+against a numpy replica of the same integer arithmetic. `--window` plays it from the computer keyboard through
+a 256-sample stream (5 ms latency).
+
+Two things that mattered: `aie::set_saturation(none)`, because phases must wrap (saturation would stop the
+oscillator at the end of its first turn); and the modulation depth: with the DX7's 0.75 dB per level step a
+modulator at level 80 under an envelope at 85 is -14 dB - 10 dB = 0.06 of full scale, so "full scale" must be
+large (6 turns = 38 rad of phase deviation here) or nothing bends. The numbers are tuned by spectral centroid,
+not by ear.
 
 ## Room acoustics -> impulse response -> reverb (a chain)
 
