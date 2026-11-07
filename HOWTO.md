@@ -41,13 +41,16 @@ in unattended runs: write PNG (cv2.imwrite) or WAV (soundfile) outputs instead.
 6. **Budgets.** Per core 64 KB L1 (fifo depths x object sizes + static tables + stack); per column
    one memtile split plus one join (two splits + join does not place); shim 2 DMA channels each
    way per column. Pack all per-cell fields into one stream.
-7. **Not native, avoid in hot loops:** float vector multiply, scalar float mul/div, int divide,
+7. **Alignment.** `aie::load_v`/`store_v` need 64-byte alignment and silently round a misaligned
+   address down. Use `load_unaligned_v`/`store_unaligned_v` for any offset that is not a multiple
+   of 32 elements (16-bit) / 16 (32-bit). Static kernel variables persist across dispatches: reset.
+8. **Not native, avoid in hot loops:** float vector multiply, scalar float mul/div, int divide,
    64-bit multiply, `aie::neg` on bf16 (multiply by -1), `aie::shift_bytes` (use
    `shuffle_down_fill`), cint16/complex vectors, per-lane gather.
-8. **bf16 integrates badly** (8 mantissa bits): small increments into large values vanish. Height
+9. **bf16 integrates badly** (8 mantissa bits): small increments into large values vanish. Height
    fields, counters, accumulations over many steps: int16/int32 fixed point. Store deviations from
    a rest value when you must use bf16 (LBM).
-9. **Deliver:** the script in `fun/` with a docstring (what, how, how to run), a row in the
+10. **Deliver:** the script in `fun/` with a docstring (what, how, how to run), a row in the
    README measured table, a short README section with the lessons, output files (`*.png`,
    `*.wav`, gitignored), and a commit (`Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`
    trailer, no session links).

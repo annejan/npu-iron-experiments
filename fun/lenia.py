@@ -33,7 +33,7 @@ PADL = 32 + H2             # left pad: the data window for output x starts at x 
 S = ((W + 2 * PADL + 31) // 32) * 32   # row stride, multiple of 32
 R = 16                     # output rows per core -> 512 rows
 H = CORES * R
-KSHIFT = 19                # kernel taps scaled by 2^19 (max tap ~ 0.01 -> ~5000), output >> 19
+KSHIFT = 16                # kernel taps scaled by 2^16; sum(k) = 1 so the acc32 sum is < 32767 * 2^16 < 2^31
 PARAMS = dict(R=13, mu=0.15, sigma=0.015, dt=0.1)
 
 
@@ -59,21 +59,27 @@ static int head = 0;       // index of the oldest row
 static int filled = 0;
 
 extern "C" {{
-void lenia_push(int16_t *__restrict row) {{
-    int16_t *dst = ring + ((head + filled) % K) * S;
+/* produce: -1 reset the ring (statics persist across dispatches!), 0 push only,
+   1 push and emit the next world row (growth applied), 2 push and emit the raw convolution u (Q15, debug) */
+void lenia_row(int16_t *__restrict kern, int16_t *__restrict row, int16_t *__restrict out, int32_t produce) {{
+    if (produce < 0) {{ head = 0; filled = 0; return; }}
+    int w = head + filled; if (w >= K) w -= K;
+    int16_t *dst = ring + w * S;
     for (int x = 0; x < S; x += 32) aie::store_v(dst + x, aie::load_v<32>(row + x));
-    if (filled < K) filled++; else head = (head + 1) % K;
-}}
-/* one output row = the row at window centre, convolved with the K x K kernel, then growth */
-void lenia_step(int16_t *__restrict kern, int16_t *__restrict centre_in, int16_t *__restrict out) {{
+    if (filled < K) filled++; else {{ head++; if (head >= K) head = 0; }}
+    if (!produce) return;
     aie::set_rounding(aie::rounding_mode::conv_even);
     aie::set_saturation(aie::saturation_mode::saturate);
-    const V mu = vb({P['mu']}f), inv2s2 = vb({-1.0 / (2 * P['sigma'] ** 2) * 1.4426950408889634}f);   // * log2(e): exp2
+    const V inv2s2 = vb({-1.0 / (2 * P['sigma'] ** 2) * 1.4426950408889634}f);   // * log2(e): exp2
     const V dt = vb({P['dt']}f), one = vb(1.0f), zero = vb(0.0f), two = vb(2.0f);
+    int cidx = head + H2; if (cidx >= K) cidx -= K;
+    const int16_t *centre = ring + cidx * S;
     for (int x = 0; x < W; x += 32) {{
         aie::accum<acc32, 32> acc = aie::zeros<acc32, 32>();
+        int ridx = head;
         for (int kr = 0; kr < K; kr++) {{
-            const int16_t *d = ring + ((head + kr) % K) * S + x + PADL - H2;     // aligned (PADL - H2 = 32)
+            const int16_t *d = ring + ridx * S + x + PADL - H2;     // aligned (PADL - H2 = 32)
+            ridx++; if (ridx >= K) ridx = 0;
             aie::vector<int16_t, 64> dv = aie::concat(aie::load_v<32>(d), aie::load_v<32>(d + 32));
             aie::vector<int16_t, 32> kv = aie::load_v<32>(kern + kr * 32);
             acc = aie::sliding_mac<32, 8>(acc, kv, 0, dv, 0);
@@ -82,12 +88,15 @@ void lenia_step(int16_t *__restrict kern, int16_t *__restrict centre_in, int16_t
             acc = aie::sliding_mac<32, 8>(acc, kv, 24, dv, 24);
         }}
         // u in Q15 -> bf16 in [0, 1]
-        V u = aie::to_float<bf>(acc.to_vector<int16_t>(KSHIFT), 15);
-        V a = aie::to_float<bf>(aie::load_v<32>(centre_in + x + PADL), 15);
-        V d = tobf(aie::mac(aie::mul(mu, vb(-1.0f)), u, one));             // u - mu
-        V g = tobf(aie::mac(aie::mul(aie::exp2(tobf(aie::mul(tobf(aie::mul(d, d)), inv2s2))), two), one, vb(-1.0f)));   // 2 exp(..) - 1
+        aie::vector<int16_t, 32> uq = acc.to_vector<int16_t>(KSHIFT);
+        if (produce == 2) {{ aie::store_unaligned_v(out + x + PADL, uq); continue; }}   // PADL is not a multiple of 32: unaligned
+        // u - mu in Q15 first (exact), then bf16: bf16(u) alone is too coarse for a sigma of 0.015
+        V d = aie::to_float<bf>(aie::sub(uq, aie::broadcast<int16_t, 32>((int16_t){round(P['mu'] * 32768)})), 15);
+        V a = aie::to_float<bf>(aie::load_unaligned_v<32>(centre + x + PADL), 15);
+        V e = aie::exp2(aie::mul(tobf(aie::mul(d, d)), inv2s2).template to_vector<float>());   // exp2 takes vector<float>, returns bf16
+        V g = tobf(aie::mac(aie::mul(e, two), one, vb(-1.0f)));                                    // 2 exp(..) - 1
         V an = aie::min(aie::max(tobf(aie::mac(aie::mul(a, one), g, dt)), zero), one);
-        aie::store_v(out + x + PADL, aie::to_fixed<int16_t>(an, 15));
+        aie::store_unaligned_v(out + x + PADL, aie::to_fixed<int16_t>(an, 15));
     }}
 }}
 }}
@@ -105,26 +114,21 @@ def lenia_kernel(P):
     return k, kq
 
 
-def ext_push():
-    row_ty = np.ndarray[(S,), np.dtype[np.int16]]
-    return ExternalFunction("lenia_push", source_string=ksrc(PARAMS), arg_types=[row_ty])
-
-
-def ext_step():
+def ext_row():
     row_ty = np.ndarray[(S,), np.dtype[np.int16]]
     k_ty = np.ndarray[(K * 32,), np.dtype[np.int16]]
-    return ExternalFunction("lenia_step", source_string=ksrc(PARAMS), arg_types=[k_ty, row_ty, row_ty])
+    return ExternalFunction("lenia_row", source_string=ksrc(PARAMS), arg_types=[k_ty, row_ty, row_ty, np.dtype(np.int32)])
 
 
 @iron.jit
-def lenia_npu(world: In, kern: In, out: Out, *, cols: CompileTime[int], variant: CompileTime[str]):
+def lenia_npu(world: In, kern: In, out: Out, *, cols: CompileTime[int], outmode: CompileTime[int], variant: CompileTime[str]):
     cores = cols * ROWS
     n = (H + K - 1) * S
     world_ty = np.ndarray[(n,), np.dtype[np.int16]]
     k_ty = np.ndarray[(K * 32,), np.dtype[np.int16]]
     row_ty = np.ndarray[(S,), np.dtype[np.int16]]
     quad_ty = np.ndarray[(ROWS * S,), np.dtype[np.int16]]
-    push, step = ext_push(), ext_step()
+    k = ext_row()
     k_in = [ObjectFifo(k_ty, name=f"k{c}", depth=1) for c in range(cols)]
     col_in = [ObjectFifo(quad_ty, name=f"in{c}", depth=2) for c in range(cols)]
     col_out = [ObjectFifo(quad_ty, name=f"out{c}", depth=2) for c in range(cols)]
@@ -135,18 +139,22 @@ def lenia_npu(world: In, kern: In, out: Out, *, cols: CompileTime[int], variant:
         ro += col_out[c].prod().join([i * S for i in range(ROWS)], tile=Tile(c, 1), depths=[2] * ROWS,
                                      obj_types=[row_ty] * ROWS, names=[f"ro{c}_{i}" for i in range(ROWS)])
 
-    def core(kf, fi, fo, push, step):
+    def core(kf, fi, fo, k):
         kk = kf.acquire(1)
-        for _ in range_(K - 1):              # fill the window
-            r = fi.acquire(1); push(r); fi.release(1)
+        r = fi.acquire(1)
+        k(kk, r, r, -1)                      # reset the ring state left by the previous dispatch
+        k(kk, r, r, 0)
+        fi.release(1)
+        for _ in range_(K - 2):              # fill the window (no output yet; row doubles as a dummy out)
+            r = fi.acquire(1); k(kk, r, r, 0); fi.release(1)
         for _ in range_(R):                  # one output row per further input row
-            r = fi.acquire(1); push(r)
+            r = fi.acquire(1)
             o = fo.acquire(1)
-            step(kk, r, o)                   # r is now the row H2 below the window centre? no: see note in push
+            k(kk, r, o, outmode)
             fo.release(1); fi.release(1)
         kf.release(1)
 
-    workers = [Worker(core, [k_in[j // ROWS].cons(), ri[j].cons(), ro[j].prod(), push, step],
+    workers = [Worker(core, [k_in[j // ROWS].cons(), ri[j].cons(), ro[j].prod(), k],
                       tile=Tile(j // ROWS, 2 + j % ROWS)) for j in range(cores)]
     taps_in = [TensorAccessPattern((n,), c * ROWS * R * S, [R + K - 1, ROWS, S], [S, R * S, 1]) for c in range(cols)]
     taps_out = [TensorAccessPattern((n,), (H2 + c * ROWS * R) * S, [R, ROWS, S], [S, R * S, 1]) for c in range(cols)]
@@ -202,13 +210,13 @@ class Lenia:
         self.fix_halos(a)
         return a
 
-    def step(self):
+    def step(self, outmode=1):
         if self.upload:
             with self._in.overwrite() as x:
                 x[...] = self.pack().ravel()
             self.upload = False
         t0 = time.perf_counter()
-        lenia_npu(self._in, self._kern, self._out, cols=self.cols, variant="lenia1-" + "-".join(f"{k}{v}" for k, v in PARAMS.items()))
+        lenia_npu(self._in, self._kern, self._out, cols=self.cols, outmode=outmode, variant="lenia4-" + "-".join(f"{k}{v}" for k, v in PARAMS.items()))
         ms = (time.perf_counter() - t0) * 1e3
         with self._out.overwrite() as x:
             self.fix_halos(x.reshape(H + K - 1, S))
@@ -240,7 +248,7 @@ def reference_step(world, k, P):
 def check():
     from aie.utils.compile import remarks
     d = Path(".remarks/rem_lenia"); d.mkdir(parents=True, exist_ok=True)
-    for ef in (ext_push(), ext_step()):
+    for ef in (ext_row(),):
         rep, why = remarks.analyze(ef, "aie2p", d)
         if rep is None:
             print(why); sys.exit(1)
@@ -260,12 +268,14 @@ def main():
         return check()
     sim = Lenia()
     w0 = sim.world.copy()
-    ms = sim.step()
-    got = sim.read().copy()
     u_ref, w_ref = reference_step(w0.astype(np.float64), sim.k, PARAMS)
-    err = np.abs(got - w_ref)
-    print(f"first step (compile) {ms:.0f} ms; vs numpy: max |err| {err.max():.4f} rms {np.sqrt((err ** 2).mean()):.5f} "
-          f"(world mean {got.mean():.4f} ref {w_ref.mean():.4f})")
+    # 1. raw convolution (debug mode 2), 2. a real step, both from the same initial world
+    sim.step(outmode=2); u_got = sim.read().copy()
+    sim.world[:] = w0; sim.upload = True
+    ms = sim.step(); got = sim.read().copy()
+    eu, err = np.abs(u_got - u_ref), np.abs(got - w_ref)
+    print(f"conv vs numpy: max |err| {eu.max():.5f} ({eu.max() * 32767:.1f} LSB) rms {np.sqrt((eu ** 2).mean()):.6f}")
+    print(f"step vs numpy: max |err| {err.max():.4f} rms {np.sqrt((err ** 2).mean()):.5f} (world mean {got.mean():.4f} ref {w_ref.mean():.4f}); call {ms:.2f} ms")
     if a.window:
         import pygame
         pygame.init()

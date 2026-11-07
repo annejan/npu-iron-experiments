@@ -37,6 +37,7 @@ mlir-aie 1.4.5 (IRON) with XRT 2.26 unpacked in `../ryzenai`. `./setup.sh` once,
 | Slime chemotaxis 320x256, bf16, world on chip, 15 steps/dispatch | 41k steps/s, 3.4 Gcell-steps/s (`fun/slime.py`) |
 | Ripple tank 320x384, int16 Q12, world on chip, 5 steps/dispatch | 17k steps/s, 2.1 Gcell-steps/s (`fun/water.py`) |
 | Convolution reverb, 65536 taps, 2048-sample blocks, stereo | 0.43 ms per block per channel, 308 GMAC/s, 41x real time, bit-exact vs FFT (`fun/reverb.py`) |
+| Lenia 512x512, 27x27 kernel (729 taps/cell), int16 Q15 | 0.65-0.84 ms/step, 1200-1500 steps/s, ~250 GMAC/s, conv exact to 6 LSB (`fun/lenia.py`) |
 | LBM D2Q9 384x256, bf16 deviations, 1 step per dispatch (DMA-bound) | 2700 steps/s, 0.27 Gcell-steps/s (`fun/lbm.py`) |
 | Mandelbrot 1080p, 400 iterations, Q24 int32, 16 lanes, 32 cores | 26.9 ms (numpy 5.4 s; old scalar int64 kernel on 8 cores 34x slower) (`fun/mandel.py --bench`) |
 
@@ -56,6 +57,7 @@ Batch work per dispatch; keep one call per frame.
 | `slime.py` | slime mould / ant trails as grid chemotaxis (density + pheromone, conservative upwind flux), on-chip world, `--window` (click = food) |
 | `water.py` | ripple tank, int16 Q12 height field, on-chip world, `--window` (drag = drops, R = rain) |
 | `reverb.py` | convolution reverb: 65536-tap IR (1.4 s), 2048 taps per core, int16 Q15, `sliding_mac` FIR; `in.wav` offline with numpy check, `--play` live through the speakers (sounddevice) |
+| `lenia.py` | Lenia continuous CA: 27x27 ring-kernel convolution per step via `sliding_mac`, DDR world streamed through the cores with a 27-row ring buffer in L1, bf16 growth; `--window` |
 | `lbm.py` | Lattice-Boltzmann D2Q9 fluid, flow past a cylinder; world in DDR, streamed through all 32 cores every step, shim DMA gathers the halo rows with a 3-D pattern, cores use a 3-row sliding window (`acquire(3)`); `--window` (drag = obstacles, C = clear) |
 | `../probe/plasma.py` | 3-sine plasma, `--window` |
 
@@ -129,6 +131,26 @@ for spectral effects, and int8 matmul for neural audio (denoise, amp models). Di
 Benchmark trap: the first call of a design loads (or compiles) it and costs 0.4-1.7 s. Time
 after a warm-up call, or the throughput number is garbage (the first version of this bench
 reported 16 GMAC/s for that reason).
+
+## Big-kernel convolution (Lenia)
+
+`fun/lenia.py` is the pattern for any wide stencil or 2-D convolution: the world lives in DDR,
+each core receives its band plus K-1 halo rows through one 3-D shim DMA pattern, keeps the last K
+rows in a static ring buffer in L1 (27 x 1.2 KB) and emits one output row per input row once the
+window is full; per output vector it runs K x 4 `sliding_mac<32, 8>` (one int32 accumulator),
+then an elementwise bf16 pass (growth function with `aie::exp2`). Two lessons that cost a wrong
+picture each:
+* **`aie::load_v` / `aie::store_v` on an address that is not 64-byte aligned silently rounds the
+  address down** (to the previous 32-element boundary). No error, no warning: the picture was
+  shifted by 13 columns. Use `load_unaligned_v` / `store_unaligned_v` wherever the offset is not a
+  multiple of 32 elements, and lay the world out so the hot loads are aligned (here the data
+  window starts at `x + 32`, the output at `x + 45`).
+* **Static variables in a kernel persist across dispatches.** The ring buffer's head/fill counters
+  were left over from the previous call. Reset them explicitly at the start of each dispatch
+  (a `produce = -1` mode) rather than relying on fresh `.bss`.
+* Keep the int32 accumulator in range: sum(k) = 1 scaled by 2^16 times 32767 just fits; 2^19
+  overflowed. And subtract in int16 before converting to bf16 when the next step is a sharp
+  Gaussian (sigma 0.015): bf16(u) alone has 8 mantissa bits.
 
 ## FFT: not in aie_api on this toolchain
 
