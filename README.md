@@ -503,8 +503,18 @@ What came out of a day of making it converge, each one a wrong picture:
   dt = 0.7 converges in ~25 steps;
 * **pads of one net that overlap in the raster are one terminal** (USB-C A6/B6, stacked pads): as two
   terminals the source feeds the sink directly and half the flow is "lost" (arrival 0.5);
-* a pad's clearance ring blocks other nets only; two rings overlapping block everyone (the gap between
-  fine-pitch pads).
+* a pad's clearance ring blocks other nets only, and where two rings overlap (the gap between fine-pitch
+  pads) the cell goes to the nearer pad, else the pad is walled in; the copper itself plus half a track blocks
+  everyone (else the exported tracks overlap the neighbouring pad: shorts).
+
+The same on a real badge, the BornHack 2026 Cyber Ægg (4 layers, 610 pads; the 118 signal nets routed on the
+two outer layers, power on its planes left alone), `--video --write-pcb --write-pro`, 2.5 minutes:
+
+![bornhack2026](docs/img/physarum_bornhack2026.gif)
+
+| | |
+|---|---|
+| ![copper](docs/img/physarum_bornhack2026_copper.png) F.Cu red, B.Cu blue, zones hidden: 116/118 nets, 16672 segments, 145 vias | ![kicad](docs/img/physarum_bornhack2026_kicad.png) the file in KiCad's 3D viewer, bottom side |
 
 Honest view: this is a global estimate with a drawing, not a DRC-clean router (obstacles: pads with their
 clearance, the board box, the kept nets' tracks and vias; zones and inner layers are ignored), and the NPU plays

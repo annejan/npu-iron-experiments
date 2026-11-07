@@ -9,3 +9,8 @@ __pycache__/
 *.wav
 data/
 !docs/img/*.png
+*.gif
+*.mp4
+*.kicad_pcb
+*.kicad_pro
+!docs/img/*.gif
