@@ -130,6 +130,32 @@ Benchmark trap: the first call of a design loads (or compiles) it and costs 0.4-
 after a warm-up call, or the throughput number is garbage (the first version of this bench
 reported 16 GMAC/s for that reason).
 
+## Dense matmul: how much of the 50 TOPS the stock example gets
+
+`mlir-aie/programming_examples/basic/matrix_multiplication/whole_array/whole_array.py`, 8 columns,
+int8 in and out, NPU time from the example's own benchmark (2026-11-07):
+
+| shape | tile m,k,n | TOPS | of 50 |
+|---|---|---|---|
+| 1024^3 | 64,64,32 (default) | 3.5 | 7% |
+| 2048^3 | 64,64,32 | 3.9 | 8% |
+| 2048^3 | 64,64,64 | 8.8 | 18% |
+| 2048^3 | 128,64,64 | 15.8 | 32% |
+| 2048^3 | 128,32,128 | 16.9 | 34% |
+| 4096^3 | 128,64,64 | 14.6 | 29% |
+| 2048^3 int16 | 128,32,64 | 6.1 | 12% (int16 is 128 MAC/cycle, a quarter of int8) |
+
+The default tiles are DMA-bound; bigger output tiles (more MACs per byte moved) give 4x. Larger
+still does not fit: A, B and C tiles double-buffered must stay under 64 KB per core
+(`'aie.buffer' op could not be placed`). The ghost-intuit report reached 60% on a conv net with
+hand-written kernels and all 32 tiles per layer, so ~34% is the stock-example ceiling, not the
+chip's.
+
+```
+./env.sh python mlir-aie/programming_examples/basic/matrix_multiplication/whole_array/whole_array.py \
+    -M 2048 -K 2048 -N 2048 -m 128 -k 32 -n 128 --n-aie-cols 8 --dtype_in i8 --dtype_out i8
+```
+
 ## From ghost-intuit/xdna2-npu-experiments (Strix Point, Windows, same silicon family)
 
 Read 2026-11-07, https://github.com/ghost-intuit/xdna2-npu-experiments (CC BY 4.0):
