@@ -8,6 +8,15 @@ mlir-aie 1.4.5 (IRON) with XRT 2.26 unpacked in `../ryzenai`. `./setup.sh` once,
 ./env.sh python probe/plasma.py --window
 ```
 
+
+## Pictures
+
+| | | |
+|---|---|---|
+| ![Lenia](docs/img/lenia.png) Lenia, 27x27 kernel | ![Physarum](docs/img/physarum.png) Physarum network | ![Double slit](docs/img/schrodinger.png) Schrodinger double slit |
+| ![Ising](docs/img/ising.png) Ising at Tc | ![LBM](docs/img/lbm.png) Lattice-Boltzmann vortex street | ![Water](docs/img/water.png) Ripple tank |
+| ![SDF](docs/img/sdf64.png) SDF sphere tracer | ![Blobs](docs/img/blob48.png) Smooth-min blobs | ![Mandelbrot](docs/img/mandel.png) Mandelbrot, 32 cores |
+
 ## Hardware (xrt-smi: "NPU Krackan 1", aie2p, 6x8)
 
 | | |
