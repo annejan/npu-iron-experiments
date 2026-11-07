@@ -25,7 +25,7 @@ mlir-aie 1.4.5 (IRON) with XRT 2.26 unpacked in `../ryzenai`. `./setup.sh` once,
 | What | Number |
 |---|---|
 | Dispatch floor, host wall clock | ~155-180 us per call |
-| Host <-> NPU DMA, all 8 columns, big transfers | ~26 GB/s each way (`probe/bw.py`) |
+| Host <-> NPU DMA, all 8 columns, in and out at the same time | ~30 GB/s each way = 63 GB/s aggregate at 64 MB, 21 GB/s each way at 8 MB; a second shim channel per column or 64 KB objects change nothing (`probe/bw.py`, `probe/bw2.py`). Others report 50-98 GB/s one-way on this chip |
 | 1920x1088 RGBA frame out | ~0.31 ms |
 | One core, int16 vector mul loop at II 1 | ~52 G elements/s (ideal 56) (`probe/burn.py`) |
 | All 32 cores, same loop, wall clock incl. floor | ~850 G int16 ops/s |
