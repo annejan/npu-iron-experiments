@@ -43,6 +43,7 @@ mlir-aie 1.4.5 (IRON) with XRT 2.26 unpacked in `../ryzenai`. `./setup.sh` once,
 | Physarum 120k agents + NPU blur | 13.8 ms/step total, NPU 0.7 ms of it (the agents are the cost) (`fun/physarum.py`) |
 | Ising 512x512, 20 half-sweeps per dispatch | 2-3 G spin-updates/s (7-11k sweeps/s); |M| and E within 1% of Onsager at T = 1.5..3.5 (`fun/ising.py`) |
 | YOLO26n (stock example), whole network on 32 tiles, seeded weights, batch 1 | 11.3 ms per 640x640 image = 84 fps, bit-exact vs the integer oracle |
+| 2-D Schrodinger 512x512, int32, 1 step/dispatch (R for 3 rows + I for 1 per output row) | 0.47 ms/step, 2100 steps/s; norm conserved to 0.3% over 1400 steps (`fun/schrodinger.py`) |
 | 3-D wave FDTD 32x32x128 (131k cells), int32, 1 step/dispatch | 0.21 ms/step NPU, 0.26-0.31 ms incl. host readback: 1 s of 8 kHz room response in 2.5 s (`fun/room.py`) |
 | LBM D2Q9 384x256, bf16 deviations, 1 step per dispatch (DMA-bound) | 2700 steps/s, 0.27 Gcell-steps/s (`fun/lbm.py`) |
 | Mandelbrot 1080p, 400 iterations, Q24 int32, 16 lanes, 32 cores | 26.9 ms (numpy 5.4 s; old scalar int64 kernel on 8 cores 34x slower) (`fun/mandel.py --bench`) |
@@ -70,6 +71,7 @@ Batch work per dispatch; keep one call per frame.
 | `physarum.py` | real slime-mould networks (Jones 2010 agents on the CPU, trail blur + decay on the NPU via conv2d) |
 | `ising.py` | 2-D Ising, checkerboard Metropolis, xorshift32 RNG in the lanes, world on chip; |M| and E vs Onsager's exact solution; `--window` (up/down: temperature) |
 | `yolo_cam.py` | YOLO26n object detection on the webcam or an image, via the stock `mlir-aie/programming_examples/ml/yolo26n` (needs its exported weights) |
+| `schrodinger.py` | 2-D Schrodinger equation, Visscher scheme, int32 Q28, 5-row sliding window; a wave packet through a double slit; `--check` vs numpy |
 | `lbm.py` | Lattice-Boltzmann D2Q9 fluid, flow past a cylinder; world in DDR, streamed through all 32 cores every step, shim DMA gathers the halo rows with a 3-D pattern, cores use a 3-row sliding window (`acquire(3)`); `--window` (drag = obstacles, C = clear) |
 | `../probe/plasma.py` | 3-sine plasma, `--window` |
 
