@@ -21,7 +21,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mnist_npu as M
 
-SZ = 28; PADH = 5; NG = 64; NMB = 47; BATCH = NMB * M.B; NACT = 3; GAMMA = 0.97
+SZ = 28; PADH = 5; NG = 128; NMB = 47; BATCH = NMB * M.B; NACT = 3; GAMMA = 0.97; TMAX = 512
 HIT_REWARD = 0.5                # a return is an event too: the moves before it get this, discounted back
 LR_HALF = 300                   # learning rate lr0 / (1 + updates / LR_HALF)
 
@@ -46,26 +46,35 @@ class Pong:
     def objects(self):
         return (np.round(self.bx).astype(int), np.round(self.by).astype(int), np.round(self.py).astype(int), np.round(self.oy).astype(int))
 
-    def frame(self):
-        """uint8 (NG, 784): current objects at 255, the previous frame's at 110."""
+    def frame(self, opponent=False):
+        """uint8 (NG, 784): current objects at 255, the previous frame's at 110. The opponent's paddle is left out
+        unless asked for: a policy that sees it learns to copy it (the script follows the ball) instead of the ball."""
         f = np.zeros((NG, SZ, SZ), np.uint8); g = np.arange(NG)
         for (bx, by, py, oy), val in ((self.prev, 110), (self.objects(), 255)):
             for dy in range(-(PADH // 2), PADH // 2 + 1):
                 f[g, np.clip(py + dy, 0, SZ - 1), SZ - 2] = np.maximum(f[g, np.clip(py + dy, 0, SZ - 1), SZ - 2], val)
-                f[g, np.clip(oy + dy, 0, SZ - 1), 1] = np.maximum(f[g, np.clip(oy + dy, 0, SZ - 1), 1], val)
+                if opponent: f[g, np.clip(oy + dy, 0, SZ - 1), 1] = np.maximum(f[g, np.clip(oy + dy, 0, SZ - 1), 1], val)
             f[g, np.clip(by, 0, SZ - 1), np.clip(bx, 0, SZ - 1)] = np.maximum(f[g, np.clip(by, 0, SZ - 1), np.clip(bx, 0, SZ - 1)], val)
         return f.reshape(NG, SZ * SZ)
 
-    def step(self, act):
-        """act in {0 up, 1 stay, 2 down}. Returns reward (+1 point won, -1 lost, 0) and whether the player hit the ball."""
+    def mirrored(self):
+        """The left player's view: the frame flipped left-right, so it also plays from the right."""
+        f = self.frame(opponent=True).reshape(NG, SZ, SZ)[:, :, ::-1].copy()
+        f[:, :, 1] = 0                                                  # the right player's paddle, now on the left: not shown
+        return f.reshape(NG, SZ * SZ)
+
+    def step(self, act, opp_act=None):
+        """act in {0 up, 1 stay, 2 down}. Returns reward (+1 point won, -1 lost, 0) and whether the player hit the ball.
+        opp_act moves the left paddle instead of the script (self-play)."""
         self.prev = self.objects()
         self.py = np.clip(self.py + (act - 1) * 1.0, PADH // 2, SZ - 1 - PADH // 2)
-        self.oy = self.oy + np.clip(self.by - self.oy, -self.opp_speed, self.opp_speed)
+        if opp_act is None: self.oy = self.oy + np.clip(self.by - self.oy, -self.opp_speed, self.opp_speed)
+        else: self.oy = self.oy + (np.asarray(opp_act) - 1) * 1.0
         self.oy = np.clip(self.oy, PADH // 2, SZ - 1 - PADH // 2)
         self.bx += self.vx; self.by += self.vy
         top = self.by < 0; bot = self.by > SZ - 1
         self.by[top] = -self.by[top]; self.by[bot] = 2 * (SZ - 1) - self.by[bot]; self.vy[top | bot] *= -1
-        r = np.zeros(NG); hit = np.zeros(NG, bool)
+        r = np.zeros(NG); hit = np.zeros(NG, bool); self.hit_left = np.zeros(NG, bool)
         for side, px, pad in ((1, SZ - 2.5, self.py), (-1, 1.5, self.oy)):
             cross = (self.vx * side > 0) & ((self.bx - px) * side >= 0)
             catch = cross & (np.abs(self.by - pad) <= PADH / 2 + 0.6)
@@ -75,6 +84,7 @@ class Pong:
             self.vx[catch] = -side * np.minimum(sp[catch], 1.6) * np.cos(ang[catch]); self.vy[catch] = np.minimum(sp[catch], 1.6) * np.sin(ang[catch])
             self.bx[catch] = px - side * 0.01
             if side == 1: hit |= catch
+            else: self.hit_left |= catch
         lost = self.bx > SZ - 0.5; won = self.bx < -0.5
         r[lost] = -1; r[won] = 1
         if (lost | won).any(): self.serve(lost | won)
@@ -87,26 +97,37 @@ def policy(model, x, rng):
 
 
 class Learner:
-    def __init__(self, lr=0.05, seed=3):
-        self.rng = np.random.default_rng(seed); self.game = Pong(self.rng); self.lr = lr; self.seed = seed
+    def __init__(self, lr=0.05, seed=3, selfplay=False, lr_half=LR_HALF):
+        self.rng = np.random.default_rng(seed); self.game = Pong(self.rng); self.lr = lr; self.seed = seed; self.selfplay = selfplay
+        self.lr_half = lr_half
         self.trainer = M.TrainerNPU(NMB)
         self.model = M.Model.init(seed, ncls=NACT)
-        self.traj = [[] for _ in range(NG)]                            # per game: (frame, action) since the last point
+        ns = 2 * NG if selfplay else NG                                # self-play: both sides of every game learn
+        self.tx = np.zeros((ns, TMAX, SZ * SZ), np.uint8); self.ta = np.zeros((ns, TMAX), np.uint8)   # moves since the last event
+        self.tlen = np.zeros(ns, int)
         self.buf_x, self.buf_a, self.buf_r = [], [], []
         self.updates = 0; self.points = []; self.hits = 0; self.ms = []; self.first = True
 
     def play_until_batch(self):
-        while sum(len(a) for a in self.buf_a) < BATCH:
+        have = sum(len(a) for a in self.buf_a); g_all = np.arange(len(self.tlen))
+        while have < BATCH:
             x = self.game.frame(); a, _ = policy(self.model, x, self.rng)
-            r, hit = self.game.step(a); self.hits += int(hit.sum())
-            for g in range(NG):
-                self.traj[g].append((x[g], a[g]))
-                ev = r[g] if r[g] else (HIT_REWARD if hit[g] else 0.0)
-                if ev:                                                  # a point or a return closes the credit segment
-                    T = len(self.traj[g]); ret = ev * GAMMA ** np.arange(T - 1, -1, -1)
-                    self.buf_x.append(np.stack([t_[0] for t_ in self.traj[g]])); self.buf_a.append(np.array([t_[1] for t_ in self.traj[g]]))
-                    self.buf_r.append(ret); self.traj[g] = []
-                if r[g]: self.points.append(r[g] > 0)
+            if self.selfplay:
+                xl = self.game.mirrored(); al, _ = policy(self.model, xl, self.rng)
+                r, hit = self.game.step(a, al); self.hits += int(hit.sum())
+                x = np.concatenate([x, xl]); a = np.concatenate([a, al])
+                hit = np.concatenate([hit, self.game.hit_left]); r_side = np.concatenate([r, -r])
+            else:
+                r, hit = self.game.step(a); self.hits += int(hit.sum()); r_side = r
+            full = self.tlen >= TMAX                                     # (never in practice) keep the newest moves
+            if full.any(): self.tx[full, :-1] = self.tx[full, 1:]; self.ta[full, :-1] = self.ta[full, 1:]; self.tlen[full] = TMAX - 1
+            self.tx[g_all, self.tlen] = x; self.ta[g_all, self.tlen] = a; self.tlen += 1
+            ev = np.where(r_side != 0, r_side, np.where(hit, HIT_REWARD, 0.0))
+            for g in np.nonzero(ev)[0]:                                 # a point or a return closes the credit segment
+                T = self.tlen[g]
+                self.buf_x.append(self.tx[g, :T].copy()); self.buf_a.append(self.ta[g, :T].copy())
+                self.buf_r.append(ev[g] * GAMMA ** np.arange(T - 1, -1, -1)); self.tlen[g] = 0; have += T
+            self.points += list(r[r != 0] > 0)
 
     def update(self):
         self.play_until_batch()
@@ -115,27 +136,39 @@ class Learner:
         self.buf_x, self.buf_a, self.buf_r = ([rest_x], [rest_a], [rest_r]) if len(rest_a) else ([], [], [])
         adv = (R - R.mean()) / (R.std() + 1e-6)
         perm = self.rng.permutation(BATCH)
-        lr = self.lr / (1 + self.updates / LR_HALF)
+        lr = self.lr / (1 + self.updates / self.lr_half)
         model, st = self.trainer.run(X, A.astype(np.uint8), perm, init=self.first, seed=self.seed, lr=lr, adv=adv, ncls=NACT)
         if not st[2] and not self.first: sys.exit("the NPU lost its weights between calls")
         self.first = False; self.model = model; self.updates += 1; self.ms.append(self.trainer.ms)
+
+    def eval_vs_script(self, steps=1500, seed=99, frozen=False):
+        """Points won by the current policy against the scripted paddle (or one frozen in the middle), in fresh games;
+        also the returns per point."""
+        rng = np.random.default_rng(seed); g = Pong(rng); won = lost = hits = 0
+        for _ in range(steps):
+            a, _ = policy(self.model, g.frame(), rng); r, h = g.step(a, np.ones(NG, int) if frozen else None)
+            won += int((r > 0).sum()); lost += int((r < 0).sum()); hits += int(h.sum())
+        return won / max(1, won + lost), hits / max(1, won + lost)
 
     def win_rate(self, n=500):
         p = self.points[-n:]
         return float(np.mean(p)) if p else 0.0
 
 
-def train(n, lr, seed):
-    L = Learner(lr, seed); t0 = time.perf_counter()
+def train(n, lr, seed, selfplay=False, lr_half=LR_HALF):
+    L = Learner(lr, seed, selfplay, lr_half); t0 = time.perf_counter()
     for i in range(n):
         L.update()
         if (i + 1) % 20 == 0:
+            vs = ""
+            if (i + 1) % 200 == 0:
+                w, h = L.eval_vs_script(frozen=True); vs = f"| frozen opponent: returns per point {h:.2f}"
             print(f"update {i + 1}: points won {L.win_rate() * 100:5.1f}% (last 500 points), {len(L.points)} points so far, "
-                  f"hits per point {L.hits / max(1, len(L.points)):.2f}, NPU {np.mean(L.ms[-20:]):.1f} ms per update, {time.perf_counter() - t0:.0f} s")
+                  f"hits per point {L.hits / max(1, len(L.points)):.2f}, NPU {np.mean(L.ms[-20:]):.1f} ms per update, {time.perf_counter() - t0:.0f} s {vs}")
     return L
 
 
-def record_gif(L, path, steps=160, games=(0, 1, 2, 3), scale=8):
+def record_gif(L, path, steps=160, games=(0, 1, 2, 3), scale=8, selfplay=False):
     """Four of the games played by the current policy, drawn at 8x with a ball trail, as an animated GIF."""
     from PIL import Image, ImageDraw, ImageFont
     S = SZ * scale; pad = 6; head = 44
@@ -144,15 +177,16 @@ def record_gif(L, path, steps=160, games=(0, 1, 2, 3), scale=8):
     won_total = [0, 0]
     for step in range(steps):
         x = L.game.frame(); a, _ = policy(L.model, x, L.rng)
+        oa = policy(L.model, L.game.mirrored(), L.rng)[0] if selfplay else None
         for g in games: trails[g] = (trails[g] + [(L.game.bx[g], L.game.by[g])])[-7:]
-        r, hit = L.game.step(a)
+        r, hit = L.game.step(a, oa)
         for g in games:
             if r[g] > 0: score[g][0] += 1
             if r[g] < 0: score[g][1] += 1
             if r[g]: trails[g] = []
         won_total[0] += int((r > 0).sum()); won_total[1] += int((r < 0).sum())
         im = Image.new("RGB", (2 * S + 3 * pad, 2 * S + 3 * pad + head), (10, 10, 16)); d = ImageDraw.Draw(im)
-        d.text((pad, 12), f"NPU (orange) after {L.updates} updates", fill=(235, 235, 235), font=bigf)
+        d.text((pad, 12), "the learned policy against itself" if selfplay else f"NPU (orange) after {L.updates} updates", fill=(235, 235, 235), font=bigf)
         for k, g in enumerate(games):
             ox, oy = pad + (k % 2) * (S + pad), head + pad + (k // 2) * (S + pad)
             d.rectangle([ox, oy, ox + S - 1, oy + S - 1], fill=(18, 20, 34))
@@ -253,16 +287,23 @@ def main():
     ap.add_argument("--window", action="store_true"); ap.add_argument("--seconds", type=float); ap.add_argument("--shot")
     ap.add_argument("--gif", help="after --train, record four games of the trained policy to this GIF")
     ap.add_argument("--save", help="after --train, save the learned weights (npz)")
+    ap.add_argument("--selfplay", action="store_true", help="train against itself (both paddles learn)")
+    ap.add_argument("--lr-half", type=float, default=LR_HALF, help="learning rate lr / (1 + updates / this)")
     ap.add_argument("--play", help="play against saved weights (CPU only)")
+    ap.add_argument("--selfplay-gif", nargs=2, metavar=("WEIGHTS", "GIF"), help="record the saved policy playing itself")
     a = ap.parse_args()
     if a.train:
-        L = train(a.train, a.lr, a.seed)
+        L = train(a.train, a.lr, a.seed, a.selfplay, a.lr_half)
         if a.save: save(L.model, a.save); print(f"saved {a.save}")
         if a.gif:
             w, l_ = record_gif(L, a.gif); print(f"wrote {a.gif}; while recording, all 64 games: {w} points won, {l_} lost")
     if a.window: window(a.lr, a.seed, a.seconds, a.shot)
     if a.play: play(a.play, a.seconds)
-    if not (a.train or a.window or a.play): ap.print_help()
+    if a.selfplay_gif:
+        class _L: pass
+        L = _L(); L.rng = np.random.default_rng(a.seed); L.game = Pong(L.rng); L.model = load(a.selfplay_gif[0]); L.updates = 0
+        record_gif(L, a.selfplay_gif[1], steps=240, selfplay=True); print("wrote", a.selfplay_gif[1])
+    if not (a.train or a.window or a.play or a.selfplay_gif): ap.print_help()
 
 
 if __name__ == "__main__":
