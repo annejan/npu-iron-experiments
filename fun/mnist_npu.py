@@ -29,9 +29,9 @@ import numpy as np
 B = 64                          # minibatch
 NBB = B // 8                    # batch blocks of 8
 NPB = 98                        # pixel blocks of 8 (784 pixels)
-CPB = 14                        # pixel blocks per chunk
+CPB = 7                         # pixel blocks per chunk
 NCH = NPB // CPB                # chunks per pass
-XOBJ = CPB * NBB * 64           # bytes of a stream object (7168)
+XOBJ = CPB * NBB * 128          # bytes of a stream object (7168): bf16 tiles
 NHID, UPC = 256, 8              # hidden units, units per core
 NOUT = 16                       # logits padded to 16 (10 used)
 DOBJ = 3136                     # dump object bytes (W1 slice = 8 objects)
@@ -40,7 +40,8 @@ COLS, ROWS = 8, 4
 NCORE = COLS * ROWS
 MAGIC = 0x4D4E4953
 DATA = Path.home() / "models" / "mnist"
-OBJ_PER_MB = 1 + 2 * NCH
+MB_OBJ = 1 + NCH                # labels + chunks
+OBJ_PER_MB = 2 * MB_OBJ         # per minibatch the stream carries them twice (forward and backward pass)
 
 
 def snake(k):
@@ -74,16 +75,28 @@ def control(init, seed, lr):
     return c.view(np.uint8)
 
 
+_BF16_CACHE = {}
+
+
+def pixels_bf16(X):
+    """pixel / 256 as bf16 bits (exact), cached per array."""
+    key = (id(X), X.shape)
+    if key not in _BF16_CACHE:
+        _BF16_CACHE.clear(); _BF16_CACHE[key] = bf16_bits(X.astype(np.float32) / 256)
+    return _BF16_CACHE[key]
+
+
 def stream_into(buf, X, y, idx, init, seed, lr):
-    """Write one call's byte stream into buf (uint8): control object, then per minibatch the labels and the images
-    twice as 8x8 tiles [pb][bb][8 b][8 px] (the forward pass transposes them in the kernel). Returns the minibatch count."""
+    """Write one call's data into buf (uint8): control object, then per minibatch the labels and the images as bf16
+    8x8 tiles [pb][bb][8 b][8 px] (the forward pass transposes them in the kernel), twice, for the forward and the
+    backward pass (a shim BD cannot re-read with stride 0). Returns the minibatch count."""
     nmb = len(idx) // B
-    v = buf[XOBJ:XOBJ + nmb * OBJ_PER_MB * XOBJ].reshape(nmb, OBJ_PER_MB, XOBJ)
-    xs = X[idx[:nmb * B]]                                                # [m*B + bb*8 + b][784]
-    t = np.ascontiguousarray(xs.view(np.uint64).reshape(nmb, NBB, 8, NPB).transpose(0, 3, 1, 2))   # [m][pb][bb][b] of 8 px
-    t = t.view(np.uint8).reshape(nmb, NCH, XOBJ)
-    v[:, 1:1 + NCH] = t; v[:, 1 + NCH:] = t
-    v[:, 0, :B] = y[idx[:nmb * B]].reshape(nmb, B)
+    v = buf[XOBJ:XOBJ + nmb * OBJ_PER_MB * XOBJ].reshape(nmb, 2, MB_OBJ, XOBJ)
+    xs = pixels_bf16(X)[idx[:nmb * B]]                                   # [m*B + bb*8 + b][784] bf16 bits
+    src = xs.view(np.uint64).reshape(nmb, NBB, 8, NPB, 2).transpose(0, 3, 1, 2, 4)          # [m][pb][bb][b] of 8 px
+    for r in range(2):
+        np.copyto(v[:, r, 1:].view(np.uint64).reshape(nmb, NPB, NBB, 8, 2), src)
+        v[:, r, 0, :B] = y[idx[:nmb * B]].reshape(nmb, B)
     buf[:XOBJ] = control(init, seed, lr)
     return nmb
 
@@ -135,6 +148,7 @@ class Model:
             if k == NCORE - 1:
                 b2 = t[192:320].reshape(16, 8)[:10, 0].copy()
                 stats = d[9 * DOBJ - 64:9 * DOBJ].view(np.int32)
+        cls.prof = np.stack([dump[k][9 * DOBJ - 144:9 * DOBJ - 64].view(np.uint32) for k in range(NCORE)])
         return cls(W1, b1, W2, b2), stats
 
     def logits(self, X):
@@ -164,7 +178,7 @@ KERNEL = r"""
 #include <stdint.h>
 #include <aie_api/aie.hpp>
 #define NPB 98
-#define CPB 14
+#define CPB 7
 #define NBB 8
 #define DOBJ 3136
 #define MAGIC 0x4D4E4953
@@ -190,16 +204,25 @@ alignas(64) static int32_t lab[64];
 alignas(64) static int32_t stats[16];
 static int chunk, dumpi, cid_;
 static int32_t alive;
+// profile: per entry point, cycles running and cycles waiting since the previous entry returned
+static uint32_t prun[10], pwait[10];
+static uint32_t tlast; static bool tvalid;
+static inline uint32_t cyc() { return read_tm(0x340F8); }      // core module Timer_Low
+#ifdef PROFILE                                                  // hangs the cores on this setup (read_tm of Timer_Low)
+struct Prof {
+    int id; uint32_t t0;
+    Prof(int i) : id(i) { t0 = cyc(); if (tvalid) pwait[id] += t0 - tlast; }
+    ~Prof() { tlast = cyc(); tvalid = true; prun[id] += tlast - t0; }
+};
+#else
+struct Prof { Prof(int) {} };
+#endif
 static bf cscale;
 
 static inline VB f2b(const float *p) {
     return aie::concat(AF(aie::load_v<32>(p)).template to_vector<bf>(), AF(aie::load_v<32>(p + 32)).template to_vector<bf>());
 }
-static inline VB u2b(const uint8_t *p) {                  // pixels / 256, exact in bf16
-    aie::vector<uint8, 64> v = aie::load_v<64>(p);
-    return aie::concat(AF(aie::to_float<float>(v.template extract<32>(0), 8)).template to_vector<bf>(),
-                       AF(aie::to_float<float>(v.template extract<32>(1), 8)).template to_vector<bf>());
-}
+static inline VB xt(const int8_t *x, int i) { return aie::load_v<64>((const bf *)x + 64 * i); }   // pixels / 256 as bf16
 static inline void st_add(float *dst, const float *add, MM &c) {   // dst = add + c (fp32)
     auto a = c.to_accum();
     for (int h = 0; h < 2; h++) {
@@ -241,27 +264,30 @@ extern "C" void k_ctl(int8_t *x, int32_t cid) {
     cscale = (bf)(*(const float *)(c + 3));
     for (int l = 0; l < 64; l++) ONES[l] = (bf)1.0f;
     for (int i = 0; i < 16; i++) stats[i] = 0;
+    for (int i = 0; i < 10; i++) { prun[i] = 0; pwait[i] = 0; }
+    tvalid = false;
     stats[1] = c[0] == MAGIC; stats[2] = alive == 0x600D;      // stats[2] = 0: the weights were lost (device reset)
     refresh_w2();
     dumpi = 0;
 }
 
-extern "C" void k_lab(int8_t *x) {
+extern "C" void k_lab(int8_t *x) {             // the first copy: labels; the second copy only resets the chunk counter
+    Prof prof_(1);
     for (int i = 0; i < 64; i++) lab[i] = ((const uint8_t *)x)[i];
     chunk = 0;
 }
 
 // ---- forward chunk: H^T[bb] (+)= W1^T[pb] X^T[pb][bb] over the chunk's 14 pixel blocks (tiles arrive as [b][p])
 extern "C" void k_fwd(int8_t *x) {
+    Prof prof_(2);
 #ifdef NOCOMPUTE
     chunk++; return;
 #endif
-    const uint8_t *xt = (const uint8_t *)x;
     const int pb0 = chunk * CPB;
     for (int p = 0; p < CPB; p++) aie::store_v(W1Tb + 64 * p, f2b(W1T + 64 * (pb0 + p)));
     for (int bb = 0; bb < NBB; bb++) {
         MM c;
-        for (int p = 0; p < CPB; p++) c.mac(aie::load_v<64>(W1Tb + 64 * p), aie::transpose(u2b(xt + (p * NBB + bb) * 64), 8, 8));
+        for (int p = 0; p < CPB; p++) c.mac(aie::load_v<64>(W1Tb + 64 * p), aie::transpose(xt(x, p * NBB + bb), 8, 8));
         st_add(H + 64 * bb, chunk == 0 ? b1T : H + 64 * bb, c);
     }
     chunk++;
@@ -281,8 +307,20 @@ static void COLD partial_bb(int bb, const float *sin, float *o, bool last) {
     }
 }
 
-extern "C" void k_part(float *so) { for (int bb = 0; bb < NBB; bb++) partial_bb(bb, nullptr, so + bb * 128, false); }
+extern "C" void k_part(float *so) {
+    Prof prof_(3);
+#ifdef NOCHAIN
+    return;
+#endif
+ for (int bb = 0; bb < NBB; bb++) partial_bb(bb, nullptr, so + bb * 128, false); }
+static void add_to(const float *si, float *so) {
+    for (int i = 0; i < NBB * 128; i += 32) aie::store_v(so + i, aie::add(AF(aie::load_v<32>(so + i)), aie::load_v<32>(si + i)).template to_vector<float>());
+}
 extern "C" void k_add(float *si, float *so) {           // the chain hop: so += si
+    Prof prof_(4);
+#if defined(NOCHAIN) || defined(NOHOP)
+    return;
+#endif
     for (int i = 0; i < NBB * 128; i += 32) aie::store_v(so + i, aie::add(AF(aie::load_v<32>(so + i)), aie::load_v<32>(si + i)).template to_vector<float>());
 }
 
@@ -314,7 +352,13 @@ static void COLD grad(const bf *g, bool last) {
     chunk = 0;
 }
 
-extern "C" void k_grad(bf *g) { grad(g, false); }
+extern "C" void k_grad(bf *g) {
+    Prof prof_(7);
+#if defined(NOCHAIN) || defined(NOGRAD)
+    return;
+#endif
+    grad(g, false);
+}
 
 // ---- last core: logits -> softmax -> G = -lr/B (p - onehot), broadcast and keep a copy
 alignas(64) static float SR[16 * 16];             // rows o of 16 lanes (two batch blocks)
@@ -358,23 +402,41 @@ static void COLD softmax_pair(int pr, bf *gout) {
     }
 }
 
-extern "C" void k_lpart(float *L) { for (int bb = 0; bb < NBB; bb++) partial_bb(bb, nullptr, L + bb * 128, true); }
+extern "C" void k_lpart(float *L) {
+    Prof prof_(5);
+#ifdef NOCHAIN
+    return;
+#endif
+ for (int bb = 0; bb < NBB; bb++) partial_bb(bb, nullptr, L + bb * 128, true); }
 extern "C" void k_last(float *si, float *L, bf *gout) {
-    k_add(si, L); Lg = L;
+    Prof prof_(6);
+#ifdef NOCHAIN
+    return;
+#endif
+    add_to(si, L); Lg = L;
+#ifdef NOGRAD
+    return;
+#endif
     for (int pr = 0; pr < NBB / 2; pr++) softmax_pair(pr, gout);
+}
+extern "C" void k_lgrad() {                             // the last core's own update, after G has been released
+    Prof prof_(7);
+#if defined(NOCHAIN) || defined(NOGRAD)
+    return;
+#endif
     grad(GT, true);
 }
 
 // ---- backward chunk: W1^T[pb] += dh^T X[pb] (X tiles [bb][b][p])
 extern "C" void k_bwd(int8_t *x) {
+    Prof prof_(8);
 #ifdef NOCOMPUTE
     chunk++; return;
 #endif
-    const uint8_t *xb = (const uint8_t *)x;
     const int pb0 = chunk * CPB;
     for (int p = 0; p < CPB; p++) {
         MM c;
-        for (int bb = 0; bb < NBB; bb++) c.mac(aie::load_v<64>(dhT + 64 * bb), u2b(xb + (p * NBB + bb) * 64));
+        for (int bb = 0; bb < NBB; bb++) c.mac(aie::load_v<64>(dhT + 64 * bb), xt(x, p * NBB + bb));
         st_add(W1T + 64 * (pb0 + p), W1T + 64 * (pb0 + p), c);
     }
     chunk++;
@@ -392,6 +454,8 @@ extern "C" void k_dump(int8_t *o) {
         for (int i = 0; i < 128; i += 32) aie::store_v(f + 192 + i, aie::load_v<32>(b2T + i));
         int32_t *t = (int32_t *)(o + DOBJ - 64);
         for (int i = 0; i < 16; i++) t[i] = stats[i];
+        uint32_t *pr = (uint32_t *)(o + DOBJ - 64 - 80);
+        for (int i = 0; i < 10; i++) { pr[i] = prun[i]; pr[10 + i] = pwait[i]; }
     }
     dumpi++;
 }
@@ -405,19 +469,20 @@ def build_program(nmb):
     from aie.iron import Buffer, ExternalFunction, ObjectFifo, Program, Runtime, Worker
     from aie.iron.controlflow import range_
     from aie.iron.device import Tile
-    nobj = 1 + nmb * OBJ_PER_MB
     x_ty = np.ndarray[(XOBJ,), np.dtype[np.int8]]
     s_ty = np.ndarray[(NBB * 2 * 64,), np.dtype[np.float32]]
     g_ty = np.ndarray[(NBB * 2 * 64,), np.dtype[np.int16]]          # bf16 bits
     o_ty = np.ndarray[(DOBJ,), np.dtype[np.int8]]; o4_ty = np.ndarray[(ROWS * DOBJ,), np.dtype[np.int8]]
     i32 = np.dtype(np.int32)
     decl = "#include <stdint.h>\n"
-    src = ("#define NOCOMPUTE\n" if os.environ.get("MNIST_NOCOMPUTE") else "") + KERNEL
+    nc = os.environ.get("MNIST_NOCOMPUTE", "")
+    src = ("#define NOCOMPUTE\n" if nc else "") + ("#define NOCHAIN\n" if nc == "2" else "") + \
+          ("#define NOGRAD\n" if nc == "A" else "") + ("#define NOHOP\n" if nc == "B" else "") + KERNEL
     kctl = ExternalFunction("k_ctl", source_string=src, arg_types=[x_ty, i32])
     kf = {n: ExternalFunction(n, source_string=decl + f'extern "C" void {n}({sig});\n', arg_types=at) for n, sig, at in [
         ("k_lab", "int8_t *", [x_ty]), ("k_fwd", "int8_t *", [x_ty]), ("k_bwd", "int8_t *", [x_ty]),
         ("k_part", "float *", [s_ty]), ("k_add", "float *, float *", [s_ty, s_ty]), ("k_lpart", "float *", [s_ty]),
-        ("k_last", "float *, float *, int16_t *", [s_ty, s_ty, g_ty]),
+        ("k_last", "float *, float *, int16_t *", [s_ty, s_ty, g_ty]), ("k_lgrad", "void", []),
         ("k_grad", "int16_t *", [g_ty]), ("k_dump", "int8_t *", [o_ty])]}
 
     xi = ObjectFifo(x_ty, name="xin", depth=2)
@@ -434,6 +499,7 @@ def build_program(nmb):
             for _ in range_(NCH):
                 x = xf.acquire(1); kfwd(x); xf.release(1)
             middle()
+            x = xf.acquire(1); klab(x); xf.release(1)
             for _ in range_(NCH):
                 x = xf.acquire(1); kbwd(x); xf.release(1)
 
@@ -458,11 +524,11 @@ def build_program(nmb):
             g = gi.acquire(1); kgrad(g); gi.release(1)
         step_loop(xf, klab, kfwd, kbwd, middle); tail(of, kdump)
 
-    def body_last(xf, si, go, of, L, kctl, klab, kfwd, kbwd, klpart, klast, kdump, cid):
+    def body_last(xf, si, go, of, L, kctl, klab, kfwd, kbwd, klpart, klast, klgrad, kdump, cid):
         x = xf.acquire(1); kctl(x, cid); xf.release(1)
 
         def middle():
-            klpart(L); a = si.acquire(1); g = go.acquire(1); klast(a, L, g); go.release(1); si.release(1)
+            klpart(L); a = si.acquire(1); g = go.acquire(1); klast(a, L, g); go.release(1); si.release(1); klgrad()
         step_loop(xf, klab, kfwd, kbwd, middle); tail(of, kdump)
 
     workers = []
@@ -475,9 +541,9 @@ def build_program(nmb):
             workers.append(Worker(body_mid, [xb.cons(depth=2), chain[k - 1].cons(), chain[k].prod(), gf.cons(), of] + common + [kf["k_part"], kf["k_add"], kf["k_grad"], kf["k_dump"], k], tile=tile, dynamic_objfifo_lowering=True))
         else:
             L = Buffer(s_ty, name="logits")
-            workers.append(Worker(body_last, [xb.cons(depth=2), chain[k - 1].cons(), gf.prod(), of, L] + common + [kf["k_lpart"], kf["k_last"], kf["k_dump"], k], tile=tile, dynamic_objfifo_lowering=True))
+            workers.append(Worker(body_last, [xb.cons(depth=2), chain[k - 1].cons(), gf.prod(), of, L] + common + [kf["k_lpart"], kf["k_last"], kf["k_lgrad"], kf["k_dump"], k], tile=tile, dynamic_objfifo_lowering=True))
 
-    words = nobj * XOBJ // 4; dwords = COLS * NDUMP * ROWS * DOBJ // 4
+    words = (1 + nmb * OBJ_PER_MB) * XOBJ // 4; dwords = COLS * NDUMP * ROWS * DOBJ // 4
     in_ty = np.ndarray[(words,), np.dtype[np.int32]]; d_ty = np.ndarray[(dwords,), np.dtype[np.int32]]
     per = 256 * XOBJ // 4                                          # words per fill (256 objects)
 
@@ -508,22 +574,43 @@ def _jit():
 class TrainerNPU:
     """One compiled program per minibatch count; weights stay on the chip between calls."""
 
-    def __init__(self, nmb):
+    def __init__(self, nmb, nbuf=1):
         import aie.iron as iron
         self.nmb = nmb; self.fn = _jit()
         self.variant = "mnist-" + hashlib.md5((KERNEL + str(nmb) + str(B) + os.environ.get("MNIST_NOCOMPUTE", "")).encode()).hexdigest()[:10]
-        self.src = iron.zeros(((1 + nmb * OBJ_PER_MB) * XOBJ // 4,), dtype=np.int32, device="npu")
+        self.srcs = [iron.zeros(((1 + nmb * OBJ_PER_MB) * XOBJ // 4,), dtype=np.int32, device="npu") for _ in range(nbuf)]
+        self.src = self.srcs[0]
         self.dump = iron.zeros((COLS * NDUMP * ROWS * DOBJ // 4,), dtype=np.int32, device="npu")
         self.ms = 0.0
 
-    def run(self, X, y, idx, init=False, seed=1, lr=0.4):
-        with self.src.overwrite() as v:
-            nmb = stream_into(v.view(np.uint8), X, y, idx, init, seed, lr)
-        assert nmb == self.nmb, (nmb, self.nmb)
+    def again(self):
+        """Run the stream already in the buffer once more (benchmarks: no host work in between)."""
         t0 = time.perf_counter()
         self.fn(self.src, self.dump, nmb=self.nmb, variant=self.variant)
         self.ms = (time.perf_counter() - t0) * 1e3
+
+    def prepare(self, X, y, idx, init=False, seed=1, lr=0.4, buf=0):
+        with self.srcs[buf].overwrite() as v:
+            nmb = stream_into(v.view(np.uint8), X, y, idx, init, seed, lr)
+        assert nmb == self.nmb, (nmb, self.nmb)
+
+    def call(self, buf=0):
+        self.src = self.srcs[buf]
+        t0 = time.perf_counter()
+        self.fn(self.src, self.dump, nmb=self.nmb, variant=self.variant)
+        self.ms = (time.perf_counter() - t0) * 1e3
+        return self.result()
+
+    def run(self, X, y, idx, init=False, seed=1, lr=0.4):
+        self.prepare(X, y, idx, init, seed, lr)
+        return self.call()
+
+    def result(self):
         raw = self.dump.numpy().view(np.uint8).reshape(COLS, NDUMP, ROWS, DOBJ)
+        return self._parse(raw)
+
+    @staticmethod
+    def _parse(raw):
         per_core = np.zeros((NCORE, NDUMP * DOBJ), np.uint8)
         for k in range(NCORE):
             c, r = snake(k); per_core[k] = raw[c, :, r, :].reshape(-1)
@@ -555,17 +642,25 @@ def selftest():
 
 
 def train(epochs, seed=1, lr=0.4, verbose=True):
+    """Epoch e+1's stream is written by a second thread into the other buffer while the NPU runs epoch e."""
+    from concurrent.futures import ThreadPoolExecutor
     Xtr, ytr, Xte, yte = load_mnist()
     nmb = len(Xtr) // B
-    t = TrainerNPU(nmb); rng = np.random.default_rng(seed); hist = []
+    t = TrainerNPU(nmb, nbuf=2); rng = np.random.default_rng(seed); hist = []
+    perms = [rng.permutation(len(Xtr)) for _ in range(epochs)]
+    pool = ThreadPoolExecutor(1)
+    nxt = pool.submit(t.prepare, Xtr, ytr, perms[0], True, seed, lr, 0)
+    t_start = time.perf_counter(); npu_total = 0.0
     for ep in range(epochs):
-        idx = rng.permutation(len(Xtr))
-        th = time.perf_counter()
-        model, st = t.run(Xtr, ytr, idx, init=(ep == 0), seed=seed, lr=lr)
-        host = (time.perf_counter() - th) * 1e3 - t.ms
+        nxt.result()
+        if ep + 1 < epochs: nxt = pool.submit(t.prepare, Xtr, ytr, perms[ep + 1], False, seed, lr, (ep + 1) % 2)
+        model, st = t.call(ep % 2); npu_total += t.ms
+        if not st[2]: sys.exit("the NPU lost its weights between calls (autosuspend after 5 s idle?)")
         acc = model.accuracy(Xte, yte); hist.append(acc)
         if verbose:
-            print(f"epoch {ep + 1}: test {acc * 100:.2f}%  train (on the fly) {st[0] / (nmb * B) * 100:.2f}%  NPU {t.ms:.1f} ms per epoch (host stream prep {host:.0f} ms)")
+            print(f"epoch {ep + 1}: test {acc * 100:.2f}%  train (on the fly) {st[0] / (nmb * B) * 100:.2f}%  NPU {t.ms:.1f} ms")
+    if verbose:
+        print(f"{epochs} epochs: {time.perf_counter() - t_start:.2f} s wall clock, {npu_total:.0f} ms of it in NPU calls (the first includes loading the design)")
     return model, hist
 
 
@@ -679,14 +774,23 @@ def main():
     ap.add_argument("--epochs", type=int, default=0)
     ap.add_argument("--lr", type=float, default=0.4)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--bench", action="store_true", help="time one epoch's dispatch 6x back to back (warm clocks)")
     ap.add_argument("--window", action="store_true")
     ap.add_argument("--seconds", type=float, help="end the window after this many seconds")
     ap.add_argument("--shot", help="save a screenshot of the window at the end (with --seconds)")
     a = ap.parse_args()
     if a.selftest: selftest()
-    if a.epochs: train(a.epochs, a.seed, a.lr)
+    if a.epochs:
+        train(a.epochs, a.seed, a.lr)
+
+    if a.bench:
+        Xtr, ytr, _, _ = load_mnist(); t = TrainerNPU(len(Xtr) // B)
+        t.run(Xtr, ytr, np.random.default_rng(0).permutation(len(Xtr)), init=True, lr=a.lr)
+        ms = []
+        for _ in range(6): t.again(); ms.append(t.ms)
+        print(f"one epoch (937 minibatches of 64) per dispatch, back to back: min {min(ms):.1f} ms, median {np.median(ms):.1f} ms  {[round(m, 1) for m in ms]}")
     if a.window: window(a.lr, a.seed, seconds=a.seconds, shot=a.shot)
-    if not (a.selftest or a.epochs or a.window): ap.print_help()
+    if not (a.selftest or a.epochs or a.window or a.bench): ap.print_help()
 
 
 if __name__ == "__main__":
