@@ -70,9 +70,9 @@ def bf16(x):
     return (bf16_bits(x).astype(np.uint32) << 16).view(np.float32)
 
 
-def control(init, seed, lr):
+def control(init, seed, lr, ncls=NOUT):
     c = np.zeros(XOBJ // 4, np.int32)
-    c[0] = MAGIC; c[1] = int(init); c[2] = seed
+    c[0] = MAGIC; c[1] = int(init); c[2] = seed; c[4] = ncls
     c[3] = bf16(np.array([-lr / B], np.float32)).view(np.int32)[0]
     return c.view(np.uint8)
 
@@ -88,7 +88,7 @@ def pixels_bf16(X):
     return _BF16_CACHE[key]
 
 
-def stream_into(buf, X, y, idx, init, seed, lr):
+def stream_into(buf, X, y, idx, init, seed, lr, adv=None, ncls=NOUT):
     """Write one call's data into buf (uint8): control object, then per minibatch the labels and the images as bf16
     8x8 tiles [pb][bb][8 b][8 px] (the forward pass transposes them in the kernel), twice, for the forward and the
     backward pass (a shim BD cannot re-read with stride 0). Returns the minibatch count."""
@@ -96,10 +96,12 @@ def stream_into(buf, X, y, idx, init, seed, lr):
     v = buf[XOBJ:XOBJ + nmb * OBJ_PER_MB * XOBJ].reshape(nmb, 2, MB_OBJ, XOBJ)
     xs = pixels_bf16(X)[idx[:nmb * B]]                                   # [m*B + bb*8 + b][784] bf16 bits
     src = xs.view(np.uint64).reshape(nmb, NBB, 8, NPB, 2).transpose(0, 3, 1, 2, 4)          # [m][pb][bb][b] of 8 px
+    w = np.ones(nmb * B, np.float32) if adv is None else np.asarray(adv, np.float32)[idx[:nmb * B]]
     for r in range(2):
         np.copyto(v[:, r, 1:].view(np.uint64).reshape(nmb, NPB, NBB, 8, 2), src)
         v[:, r, 0, :B] = y[idx[:nmb * B]].reshape(nmb, B)
-    buf[:XOBJ] = control(init, seed, lr)
+        v[:, r, 0, 256:256 + 4 * B] = w.reshape(nmb, B).view(np.uint8).reshape(nmb, 4 * B)
+    buf[:XOBJ] = control(init, seed, lr, ncls)
     return nmb
 
 
@@ -121,7 +123,7 @@ class Model:
         self.W1, self.b1, self.W2, self.b2 = W1, b1, W2, b2
 
     @classmethod
-    def init(cls, seed):
+    def init(cls, seed, ncls=NOUT):
         W1 = np.zeros((784, NHID), np.float32); W2 = np.zeros((NHID, NOUT), np.float32)
         for k in range(NCORE):
             w1, s = xorshift_init(seed, k, NPB * 64, 27)
@@ -131,7 +133,8 @@ class Model:
                 s ^= s << np.uint32(13); s ^= s >> np.uint32(17); s ^= s << np.uint32(5)
                 w2[i * 32:(i + 1) * 32] = (s.view(np.int32) >> 8).astype(np.float32) * np.float32(2.0 ** -26)
             W2[k * UPC:(k + 1) * UPC] = w2.reshape(NOUT, UPC).T              # [o][u]
-        return cls(W1, np.zeros(NHID, np.float32), W2, np.zeros(NOUT, np.float32))
+        b2 = np.zeros(NOUT, np.float32); b2[ncls:] = -1.0e4
+        return cls(W1, np.zeros(NHID, np.float32), W2, b2)
 
     @classmethod
     def from_dump(cls, dump):
@@ -159,7 +162,7 @@ class Model:
     def accuracy(self, X, y):
         return float((self.logits(X).argmax(1) == y).mean())
 
-    def step(self, x, y, lr, emulate=True):
+    def step(self, x, y, lr, emulate=True, adv=None):
         """One SGD step in numpy; emulate=True rounds where the NPU rounds to bf16."""
         r = bf16 if emulate else (lambda a: a)
         x = x.astype(np.float32) / 256
@@ -168,6 +171,7 @@ class Model:
         p = np.exp(z - z.max(1, keepdims=True)); p /= p.sum(1, keepdims=True)
         g = p.copy(); g[np.arange(len(y)), y] -= 1
         c = float(bf16(np.array([-lr / B], np.float32))[0]) if emulate else -lr / B
+        if adv is not None: g = r(r(g) * r(np.asarray(adv, np.float32))[:, None])
         g = r(r(g) * c)
         dh = r((g @ r(self.W2).T) * (h > 0))
         self.W2 += r(h).T @ g; self.b2 += g.sum(0); self.W1 += x.T @ dh; self.b1 += dh.sum(0)
@@ -202,6 +206,8 @@ alignas(64) static float b2T[2 * 64];            // [half][o][b] = b2[o]; classe
 alignas(64) static bf GT[NBB * 2 * 64];          // last core: its own copy of G
 alignas(64) static bf ONES[64];
 alignas(64) static int32_t lab[64];
+alignas(64) static float advw[64];                 // per-sample weight of the gradient (1 for supervised learning)
+static int ncls = 16;
 alignas(64) static int32_t stats[16];
 static int chunk, dumpi, cid_;
 static int32_t alive;
@@ -260,7 +266,11 @@ extern "C" void k_ctl(int8_t *x, int32_t cid) {
     aie::set_rounding(aie::rounding_mode::conv_even);
     const int32_t *c = (const int32_t *)x;
     cid_ = cid;
-    if (c[1]) { init_weights((uint32_t)c[2]); alive = 0x600D; }
+    ncls = c[4] > 0 ? c[4] : 16;
+    if (c[1]) {
+        init_weights((uint32_t)c[2]); alive = 0x600D;
+        for (int o = ncls; o < 16; o++) for (int b = 0; b < 8; b++) b2T[(o >> 3) * 64 + (o & 7) * 8 + b] = -1.0e4f;   // unused classes off
+    }
     cscale = (bf)(*(const float *)(c + 3));
     for (int l = 0; l < 64; l++) ONES[l] = (bf)1.0f;
     for (int i = 0; i < 16; i++) stats[i] = 0;
@@ -274,6 +284,7 @@ extern "C" void k_ctl(int8_t *x, int32_t cid) {
 extern "C" void k_lab(int8_t *x) {             // the first copy: labels; the second copy only resets the chunk counter
     Prof prof_(1);
     for (int i = 0; i < 64; i++) lab[i] = ((const uint8_t *)x)[i];
+    for (int i = 0; i < 64; i += 32) aie::store_v(advw + i, aie::load_v<32>((const float *)(x + 256) + i));
     chunk = 0;
 }
 
@@ -374,6 +385,7 @@ static void COLD softmax_pair(int pr, bf *gout) {
     V16 m = aie::load_v<16>(SR);
     for (int o = 1; o < 16; o++) m = aie::max(m, aie::load_v<16>(SR + 16 * o));
     aie::vector<int32, 16> lb = aie::load_v<16>(lab + 16 * pr);
+    const aie::vector<bf, 16> av = aie::accum<accfloat, 16>(aie::load_v<16>(advw + 16 * pr)).template to_vector<bf>();
     V16 s = aie::zeros<float, 16>(), ty = aie::zeros<float, 16>();
     for (int o = 0; o < 16; o++) {
         V16 row = aie::load_v<16>(SR + 16 * o);
@@ -392,6 +404,7 @@ static void COLD softmax_pair(int pr, bf *gout) {
         V16 p = aie::mul(aie::load_v<16>(SE + 16 * o), r).template to_vector<float>();
         V16 oh = aie::select(aie::zeros<float, 16>(), aie::broadcast<float, 16>(1.0f), aie::eq(lb, aie::broadcast<int32, 16>(o)));
         aie::vector<bf, 16> d = aie::sub(aie::accum<accfloat, 16>(p), oh).template to_vector<bf>();
+        d = aie::mul(d, av).template to_vector<bf>();                    // policy gradient: weighted by the advantage
         aie::vector<bf, 16> gv = aie::mul(d, cscale).template to_vector<bf>();
         const int h = o >> 3, oo = o & 7;
         for (int q = 0; q < 2; q++) {
@@ -589,9 +602,9 @@ class TrainerNPU:
         self.fn(self.src, self.dump, nmb=self.nmb, variant=self.variant)
         self.ms = (time.perf_counter() - t0) * 1e3
 
-    def prepare(self, X, y, idx, init=False, seed=1, lr=0.4, buf=0):
+    def prepare(self, X, y, idx, init=False, seed=1, lr=0.4, buf=0, adv=None, ncls=NOUT):
         with self.srcs[buf].overwrite() as v:
-            nmb = stream_into(v.view(np.uint8), X, y, idx, init, seed, lr)
+            nmb = stream_into(v.view(np.uint8), X, y, idx, init, seed, lr, adv, ncls)
         assert nmb == self.nmb, (nmb, self.nmb)
 
     def call(self, buf=0):
@@ -601,8 +614,8 @@ class TrainerNPU:
         self.ms = (time.perf_counter() - t0) * 1e3
         return self.result()
 
-    def run(self, X, y, idx, init=False, seed=1, lr=0.4):
-        self.prepare(X, y, idx, init, seed, lr)
+    def run(self, X, y, idx, init=False, seed=1, lr=0.4, adv=None, ncls=NOUT):
+        self.prepare(X, y, idx, init, seed, lr, adv=adv, ncls=ncls)
         return self.call()
 
     def result(self):
