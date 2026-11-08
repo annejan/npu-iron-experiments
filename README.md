@@ -123,7 +123,7 @@ stated, min or median after a warm-up call, host wall clock from Python unless t
 | DX7 FM synth, 512 voices x 6 operators, 256-sample blocks | 0.5 ms per block (5.3 ms of audio), 1.6 G operator-samples/s, bit-exact replica (`fun/dx7.py`) |
 | NAM guitar amp (WaveNet, 13320 MAC/sample), 64-sample blocks, 16 cores per amp | 0.54 ms per block (1.33 ms of audio) for two amps at once, 65.9 dB SNR vs the float32 model with bf16 hi+lo pairs, 48 dB with single bf16 weights; live at 1.3 ms blocks, no underruns (`fun/nam_amp.py`) |
 | Fast neural style transfer (Johnson TransformerNet, 1.68 M params, 13.8 GMAC per 320x240 frame), int8, 31 phases on 32 cores in one dispatch | **16.7 ms per frame on the NPU**, 18.6 ms (54 fps) for the whole Python call with upload and readback; 45-52 dB PSNR from a numpy emulation of the int8 design, which is 27-45 dB from the float32 model depending on the style (`fun/style_cam.py`) |
-| MNIST training (784-256-10 MLP, bf16 matmuls, fp32 master weights resident in L1, model parallel over 32 cores), 937 minibatches of 64 per dispatch | **49.5 ms per epoch** on the NPU back to back (84 ms when the 200 MB stream was just rewritten; numpy fp32 on the CPU: 280 ms), 96.5% test accuracy after one epoch, 97.9% after five (numpy, same setup: 96.7 / 97.9); initialisation bit-exact, one SGD step within 1-3% of a bf16 numpy replica (`fun/mnist_npu.py`) |
+| MNIST training (784-256-10 MLP, bf16 matmuls, fp32 master weights resident in L1, model parallel over 32 cores), 937 minibatches of 64 per dispatch | **49.5 ms per epoch** on the NPU back to back (84 ms when the 200 MB stream was just rewritten; numpy fp32 on the CPU: 280 ms), 96.4% test accuracy after one epoch, 97.9% after five (numpy, same setup: 96.7 / 97.9); initialisation bit-exact, one SGD step within about 1% of a bf16 numpy replica (`fun/mnist_npu.py`) |
 | Additive synth, 3072 partials, 1024-sample blocks | 0.38 ms per block (21 ms of audio: 56x real time for all 3072 partials) = 8 G partial-samples/s, amplitude drift-free, 0.03 Hz tuning (`fun/additive.py`) |
 | Binaural, 32 sources x 2 ears x 160 taps, 1024-sample blocks | 0.28 ms per block (dispatch-bound), bit-exact, 38x real time (`fun/binaural.py`) |
 | conv2d engine 512x512: K=3 / 7 / 15 | 0.27 / 0.35 / 0.91 ms per pass, 1-4 LSB vs numpy (`fun/conv2d.py`) |
@@ -173,7 +173,7 @@ Batch work per dispatch; keep one call per frame.
 | `dx7.py` | DX7-style FM synth: 512 six-operator voices, voices in the lanes, sine through the lookup unit, the 32 algorithms as data; `--window` plays it from the keyboard, bit-exact numpy replica, `dx7_demo.wav` |
 | `nam_amp.py` | Neural Amp Modeler guitar amps (`.nam` WaveNet captures) as a 16-core pipeline per amp, two amps at once; `--wav` renders a DI through amp and cab IR, `--live` is mic/line in to speakers at 1.3 ms blocks, `--selftest` / `--stages` compare with a float32 reference per core; see the section |
 | `style_cam.py` | fast neural style transfer (the five pytorch/examples styles from the ONNX zoo) as an int8 31-phase pipeline in one dispatch; `--window` live webcam (keys 1-5 pick the style, 0 shows the input), `--vcam /dev/video10` feeds a v4l2loopback virtual camera for video calls (load the module with `exclusive_caps=1`; `--cycle 20` rotates the styles), `--image` restyles a picture, `--selftest` checks every style against the int8 emulation, float32 and onnxruntime, `--phases N --check` one phase at a time; see the section |
-| `mnist_npu.py` | the NPU trains a neural network: MNIST, forward and backward pass and SGD update on all 32 cores, weights never leave the chip; `--epochs N`, `--selftest`, `--window` shows the first-layer weights forming and the accuracy climbing, and classifies what you draw with the live weights; see the section |
+| `mnist_npu.py` | the NPU trains a neural network: MNIST, forward and backward pass and SGD update on all 32 cores, weights never leave the chip; `--epochs N`, `--selftest`, `--bench`, `--window` shows the first-layer weights forming and the accuracy climbing, classifies what you draw with the live weights, and learns new symbols you draw (keys A-F); see the section |
 | `probe/plasma.py` | 3-sine plasma, `--window` |
 | `physarum_route.py` | slime-mould router for KiCad boards (Tero's Physarum solver, every net a tube network competing for space); `--window` / `--video` show the tubes grow, `--write-pcb` writes the tubes as tracks and vias into a copy of the board (opens in KiCad), `--write-pro` writes topor priority net classes. CPU only (sparse direct solves), see the section |
 
@@ -515,7 +515,7 @@ update all on the chip, **one dispatch per epoch, 49.5 ms** with the clocks warm
 (`--bench`; numpy in float32 on the laptop's CPU: 280 ms). In a training loop that writes a fresh shuffle of the
 200 MB stream before every call, the call takes 84 ms (the buffer's cache flush counts), and the host's shuffling,
 done by a second thread, sets the wall clock: 8 epochs in 10.7 s. Accuracy follows the float32 reference: 96.5% on
-the test set after one epoch, 98.1% after five (numpy with the same initialisation and learning rate: 96.7 and 97.9).
+the test set after one epoch, 97.9% after five (numpy with the same initialisation and learning rate: 96.7 and 97.9).
 
 The split is model parallel. Core k of a snake through the 32 cores (so that chain neighbours share memory) owns
 hidden units 8k..8k+7: 784x8 of W1 and 8x10 of W2 as fp32 master weights in its L1 for the whole run (they are only
@@ -533,10 +533,14 @@ every tile oriented so that almost nothing needs transposing:
   in again, `W1^T += dh^T X`.
 
 Checks (`--selftest`): the xorshift initialisation and the dump are bit-exact against a numpy replica; one SGD step
-agrees with a numpy replica that rounds to bf16 where the chip does within 1-3% (the rest is the bf16 `exp2`/`inv`);
-the count of correct answers per minibatch matches. `--window` shows the first-layer weights turning into stroke
-detectors and the accuracy climbing (ten epochs in about 12 s, the display and the host's evaluation included), and
-classifies what you draw with the mouse using the weights the chip has at that moment.
+agrees within about 1% with a numpy replica that rounds to bf16 where the chip does (the rest is the bf16
+`exp2`/`inv`); the count of correct answers per minibatch matches.
+
+`--window` shows the first-layer weights turning into stroke detectors and the accuracy climbing, and classifies
+what you draw with the mouse using the weights the chip has at that moment. The output layer has 16 classes, ten of
+them digits; the other six are for symbols you **teach it live**: draw something, press A-F, and from then on an
+eighth of every minibatch is your examples (slightly moved, turned and scaled) mixed into MNIST. In the picture it
+was given five stars as "A" and recognises a new star after a few seconds of training, while MNIST stays at 97%.
 
 How it got from 92 to 49.5 ms per epoch: the first version added its partial logits to the running sum only after
 receiving it, which made 31 small computations sequential (now the hop is just the add, 80 ms); the last core
@@ -760,7 +764,7 @@ pad-to-pad distance and how much competition it meets along the way, binned into
   labels added); COCO itself: Lin et al. 2014, annotations CC BY 4.0.
 * MNIST (`fun/mnist_npu.py`): Yann LeCun, Corinna Cortes, Christopher J.C. Burges, CC BY-SA 3.0; downloaded to
   `~/models/mnist` from the TensorFlow mirror, not redistributed. `docs/img/mnist_npu.png` shows weights learned
-  from it and a hand-drawn (synthetic) 7, no MNIST images.
+  from it and synthetic stars and a 7 drawn by the script, no MNIST images.
 * `docs/img/style_coco.png` is the same photo restyled by the NPU. The five style networks are the
   [pytorch/examples fast_neural_style](https://github.com/pytorch/examples/tree/main/fast_neural_style) models
   (BSD-3-Clause) as exported to the [ONNX Model Zoo](https://github.com/onnx/models/tree/main/validated/vision/style_transfer/fast_neural_style)

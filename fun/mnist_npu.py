@@ -3,7 +3,9 @@
 
   ./env.sh python fun/mnist_npu.py --selftest        init bit-exact vs numpy, one step vs a numpy replica, 1 epoch
   ./env.sh python fun/mnist_npu.py --epochs 5        train, test accuracy after every epoch, NPU time per epoch
-  ./env.sh python fun/mnist_npu.py --window          watch it learn: weights, accuracy curve, draw a digit (mouse)
+  ./env.sh python fun/mnist_npu.py --window          watch it learn: weights, accuracy curve, draw a digit (mouse),
+                                                     teach it new symbols (draw, then press A-F)
+  ./env.sh python fun/mnist_npu.py --bench           one epoch per dispatch, back to back
 
 A 784-256-10 multilayer perceptron (ReLU, softmax cross-entropy, plain SGD, batch 64) trained with bf16 matmuls into
 fp32 accumulators and fp32 master weights. Model parallel: core k (along a snake through the 32 cores, so that
@@ -33,7 +35,7 @@ CPB = 7                         # pixel blocks per chunk
 NCH = NPB // CPB                # chunks per pass
 XOBJ = CPB * NBB * 128          # bytes of a stream object (7168): bf16 tiles
 NHID, UPC = 256, 8              # hidden units, units per core
-NOUT = 16                       # logits padded to 16 (10 used)
+NOUT = 16                       # classes: 10 digits + 6 symbols the window can teach
 DOBJ = 3136                     # dump object bytes (W1 slice = 8 objects)
 NDUMP = 9
 COLS, ROWS = 8, 4
@@ -120,7 +122,7 @@ class Model:
 
     @classmethod
     def init(cls, seed):
-        W1 = np.zeros((784, NHID), np.float32); W2 = np.zeros((NHID, 10), np.float32)
+        W1 = np.zeros((784, NHID), np.float32); W2 = np.zeros((NHID, NOUT), np.float32)
         for k in range(NCORE):
             w1, s = xorshift_init(seed, k, NPB * 64, 27)
             W1[:, k * UPC:(k + 1) * UPC] = np.transpose(w1.reshape(NPB, UPC, 8), (0, 2, 1)).reshape(784, UPC)
@@ -128,14 +130,13 @@ class Model:
             for i in range(4):
                 s ^= s << np.uint32(13); s ^= s >> np.uint32(17); s ^= s << np.uint32(5)
                 w2[i * 32:(i + 1) * 32] = (s.view(np.int32) >> 8).astype(np.float32) * np.float32(2.0 ** -26)
-            w2 = w2.reshape(16, UPC)                                    # [o][u]
-            W2[k * UPC:(k + 1) * UPC] = w2[:10].T
-        return cls(W1, np.zeros(NHID, np.float32), W2, np.zeros(10, np.float32))
+            W2[k * UPC:(k + 1) * UPC] = w2.reshape(NOUT, UPC).T              # [o][u]
+        return cls(W1, np.zeros(NHID, np.float32), W2, np.zeros(NOUT, np.float32))
 
     @classmethod
     def from_dump(cls, dump):
         """dump: (NCORE, NDUMP * DOBJ) bytes in snake order."""
-        W1 = np.zeros((784, NHID), np.float32); W2 = np.zeros((NHID, 10), np.float32); b1 = np.zeros(NHID, np.float32)
+        W1 = np.zeros((784, NHID), np.float32); W2 = np.zeros((NHID, NOUT), np.float32); b1 = np.zeros(NHID, np.float32)
         b2 = None; stats = None
         for k in range(NCORE):
             d = dump[k]
@@ -143,10 +144,10 @@ class Model:
             W1[:, k * UPC:(k + 1) * UPC] = np.transpose(w1, (0, 2, 1)).reshape(784, UPC)
             t = d[8 * DOBJ:9 * DOBJ].view(np.float32)
             w2t = t[:128].reshape(16, UPC)                                      # [o][u]
-            W2[k * UPC:(k + 1) * UPC] = w2t[:10].T
+            W2[k * UPC:(k + 1) * UPC] = w2t.T
             b1[k * UPC:(k + 1) * UPC] = t[128:192].reshape(UPC, 8)[:, 0]
             if k == NCORE - 1:
-                b2 = t[192:320].reshape(16, 8)[:10, 0].copy()
+                b2 = t[192:320].reshape(16, 8)[:, 0].copy()
                 stats = d[9 * DOBJ - 64:9 * DOBJ].view(np.int32)
         cls.prof = np.stack([dump[k][9 * DOBJ - 144:9 * DOBJ - 64].view(np.uint32) for k in range(NCORE)])
         return cls(W1, b1, W2, b2), stats
@@ -197,7 +198,7 @@ alignas(64) static bf hT[NBB * 64], dhT[NBB * 64];
 alignas(64) static float W2T[2 * 64];            // [half][o][u]
 alignas(64) static bf W2Tb[2 * 64], W2b[2 * 64]; // bf16 W2^T tiles [o][u] and W2 tiles [u][o]
 alignas(64) static float b1T[64];                // [u][b] = b1[u]
-alignas(64) static float b2T[2 * 64];            // [half][o][b] = b2[o]; unused logits sit at -1e4
+alignas(64) static float b2T[2 * 64];            // [half][o][b] = b2[o]; classes 10..15 are for symbols taught live
 alignas(64) static bf GT[NBB * 2 * 64];          // last core: its own copy of G
 alignas(64) static bf ONES[64];
 alignas(64) static int32_t lab[64];
@@ -250,9 +251,8 @@ static void COLD init_weights(uint32_t seed) {
         if (i < NPB * 2) aie::store_v(W1T + 32 * i, aie::to_float<float>(si, 27));
         else aie::store_v(W2T + 32 * (i - NPB * 2), aie::to_float<float>(si, 26));
     }
-    for (int l = 16; l < 64; l++) W2T[64 + l] = 0.f;      // logits 10..15 unused
     aie::store_v(b1T, aie::zeros<float, 32>()); aie::store_v(b1T + 32, aie::zeros<float, 32>());
-    for (int l = 0; l < 128; l++) b2T[l] = (l >= 64 + 16) ? -1.0e4f : 0.f;
+    for (int l = 0; l < 128; l += 32) aie::store_v(b2T + l, aie::zeros<float, 32>());
 }
 
 // ---- control object: magic, init flag, seed, -lr/B (fp32 bits, already bf16-exact)
@@ -664,18 +664,48 @@ def train(epochs, seed=1, lr=0.4, verbose=True):
     return model, hist
 
 
+CLASS_NAMES = [str(d) for d in range(10)] + list("ABCDEF")
+
+
+def to_mnist(img):
+    """A drawing (float 0..1, any size) the way MNIST was made: the ink's bounding box scaled into 20x20, centred by
+    centre of mass in 28x28. Returns uint8 (784,) or None for an empty drawing."""
+    import cv2
+    ys, xs = np.nonzero(img > 0.1)
+    if len(ys) == 0: return None
+    y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+    crop = img[y0:y1, x0:x1]; h, w = crop.shape; s_ = 20.0 / max(h, w)
+    crop = cv2.resize(crop, (max(1, round(w * s_)), max(1, round(h * s_))), interpolation=cv2.INTER_AREA)
+    out = np.zeros((28, 28), np.float32); h, w = crop.shape
+    out[(28 - h) // 2:(28 - h) // 2 + h, (28 - w) // 2:(28 - w) // 2 + w] = crop
+    cy, cx = np.average(np.indices(out.shape), axis=(1, 2), weights=out + 1e-9)
+    out = cv2.warpAffine(out, np.float32([[1, 0, 14 - cx], [0, 1, 14 - cy]]), (28, 28))
+    return (np.clip(out, 0, 1) * 255).astype(np.uint8).reshape(784)
+
+
+def augment(x, rng):
+    """A taught example, slightly moved, turned and scaled."""
+    import cv2
+    a = np.deg2rad(rng.uniform(-12, 12)); sc = rng.uniform(0.85, 1.12); tx, ty = rng.uniform(-2, 2, 2)
+    M_ = np.float32([[sc * np.cos(a), -sc * np.sin(a), 0], [sc * np.sin(a), sc * np.cos(a), 0]])
+    M_[:, 2] = np.array([14, 14]) - M_[:, :2] @ np.array([14, 14]) + [tx, ty]
+    return cv2.warpAffine(x.reshape(28, 28), M_, (28, 28)).reshape(784)
+
+
 def window(lr=0.4, seed=1, nmb=47, seconds=None, shot=None):
-    """Watch it learn: first-layer weights, test accuracy, and a drawing pad classified with the live weights."""
+    """Watch it learn: first-layer weights, test accuracy, a drawing pad classified with the live weights, and new
+    symbols taught by drawing them (keys A-F; 0-9 adds an example of a digit)."""
     import pygame
     Xtr, ytr, Xte, yte = load_mnist()
     t = TrainerNPU(nmb); rng = np.random.default_rng(seed)
     pygame.init(); W, H = 1280, 720
     screen = pygame.display.set_mode((W, H)); pygame.display.set_caption("The NPU learns MNIST")
-    font = pygame.font.SysFont(None, 24); big = pygame.font.SysFont(None, 64)
-    pad = np.zeros((280, 280), np.float32); pad_rect = pygame.Rect(900, 352, 280, 280)
+    font = pygame.font.SysFont(None, 24); small = pygame.font.SysFont(None, 20); big = pygame.font.SysFont(None, 64)
+    pad = np.zeros((280, 280), np.float32); pad_rect = pygame.Rect(930, 352, 280, 280)
     perm = rng.permutation(len(Xtr)); pos = 0; seen = 0; hist = []; t0 = time.perf_counter()
     model = None; init = True; paused = False; cur_lr = lr; npu_ms = []; last_call = 0.0
     sub = rng.choice(len(Xte), 2000, replace=False)
+    taught = {c: [] for c in range(NOUT)}; flash = ""; flash_t = 0.0
 
     def weights_surface(m):
         w = m.W1.T.reshape(NHID, 28, 28)
@@ -687,84 +717,120 @@ def window(lr=0.4, seed=1, nmb=47, seconds=None, shot=None):
         tiles = np.clip(tiles.reshape(464, 464, 3), 0, 255).astype(np.uint8)
         return pygame.transform.smoothscale(pygame.surfarray.make_surface(np.transpose(tiles, (1, 0, 2))), (672, 672))
 
-    def pad_input():
-        import cv2
-        img = cv2.resize(pad, (20, 20), interpolation=cv2.INTER_AREA)
-        if img.sum() < 1e-3: return None
-        ys, xs = np.nonzero(img > 0.05); cy, cx = (np.average(np.indices(img.shape), axis=(1, 2), weights=img + 1e-9))
-        out = np.zeros((28, 28), np.float32); oy, ox = int(round(14 - cy)), int(round(14 - cx))
-        oy = min(max(oy, 0), 8); ox = min(max(ox, 0), 8); out[oy:oy + 20, ox:ox + 20] = img
-        return (np.clip(out, 0, 1) * 255).astype(np.uint8).reshape(1, 784)
+    def batch():
+        """The next call's images: MNIST in order of a shuffle, with an eighth of them taught examples if any."""
+        nonlocal perm, pos
+        n = nmb * B
+        if pos + n > len(Xtr): perm = rng.permutation(len(Xtr)); pos = 0
+        idx = perm[pos:pos + n]; pos += n
+        ex = [(x, c) for c in taught for x in taught[c]]
+        if not ex: return Xtr, ytr, idx
+        X = Xtr[idx].copy(); y = ytr[idx].copy()
+        k = n // 8; slots = rng.choice(n, k, replace=False)
+        pick = rng.integers(0, len(ex), k)
+        X[slots] = np.stack([augment(ex[i][0], rng) for i in pick]); y[slots] = [ex[i][1] for i in pick]
+        return X, y, np.arange(n)
 
-    drawing = False
-    if shot:                                                            # a synthetic "7" on the pad for the picture
+    def draw_stroke(points, width=20):
         import cv2
-        cv2.line(pad, (70, 70), (210, 70), 1.0, 22); cv2.line(pad, (210, 70), (120, 230), 1.0, 22); pad[:] = cv2.GaussianBlur(pad, (0, 0), 3) * 1.6
-        np.clip(pad, 0, 1, out=pad)
+        for a_, b_ in zip(points[:-1], points[1:]):
+            cv2.line(pad, (int(a_[0]), int(a_[1])), (int(b_[0]), int(b_[1])), 1.0, width)
+
+    demo = []
+    if shot:                                                            # the picture: teach a star as "A", then draw one
+        import cv2
+        def star(cx, cy, r, rot):
+            pts = [(cx + r * (1 if i % 2 == 0 else 0.42) * np.sin(rot + i * np.pi / 5), cy - r * (1 if i % 2 == 0 else 0.42) * np.cos(rot + i * np.pi / 5)) for i in range(11)]
+            return pts
+        demo = [("teach", 10, star(140 + dx, 140 + dy, r, rot)) for dx, dy, r, rot in
+                ((0, 0, 110, 0), (-10, 5, 95, 0.1), (8, -6, 100, -0.08), (0, 10, 85, 0.05), (5, 0, 105, -0.12))]
+        demo += [("teach", 7, [(70, 70), (210, 70), (120, 230)])]
+        demo += [("show", None, star(145, 135, 100, 0.06))]
+
+    drawing = False; last_xy = None; t_demo = t0
     while True:
         if seconds and time.perf_counter() - t0 > seconds:
             if shot: pygame.image.save(screen, shot)
             print(f"{seen / 60000:.2f} epochs in {time.perf_counter() - t0:.1f} s, test (2000) {hist[-1][1] * 100:.2f}%, NPU {np.mean(npu_ms):.2f} ms per call of {nmb * B} images")
+            if model is not None:
+                x = to_mnist(pad)
+                if x is not None:
+                    z = model.logits(x[None])[0]; print("pad classified as", CLASS_NAMES[int(z.argmax())])
             return
+        if demo and time.perf_counter() - t_demo > 1.2:                  # scripted teaching for the screenshot
+            kind, cls_, pts = demo.pop(0); pad[:] = 0; draw_stroke(pts); t_demo = time.perf_counter()
+            if kind == "teach":
+                x = to_mnist(pad); taught[cls_].append(x); pad[:] = 0; flash = f"taught {CLASS_NAMES[cls_]}"; flash_t = time.perf_counter()
         for e in pygame.event.get():
             if e.type == pygame.QUIT or (e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE): return
-            if e.type == pygame.KEYDOWN and e.key == pygame.K_SPACE: paused = not paused
-            if e.type == pygame.KEYDOWN and e.key == pygame.K_r: init = True; hist = []; seen = 0; t0 = time.perf_counter()
-            if e.type == pygame.KEYDOWN and e.key == pygame.K_c: pad[:] = 0
-            if e.type == pygame.KEYDOWN and e.key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS): cur_lr *= 2
-            if e.type == pygame.KEYDOWN and e.key in (pygame.K_MINUS, pygame.K_KP_MINUS): cur_lr /= 2
+            if e.type == pygame.KEYDOWN:
+                if e.key == pygame.K_SPACE: paused = not paused
+                elif e.key == pygame.K_r: init = True; hist = []; seen = 0; t0 = time.perf_counter(); taught = {c: [] for c in range(NOUT)}
+                elif e.key in (pygame.K_BACKSPACE, pygame.K_DELETE): pad[:] = 0
+                elif e.key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS): cur_lr *= 2
+                elif e.key in (pygame.K_MINUS, pygame.K_KP_MINUS): cur_lr /= 2
+                else:
+                    name = pygame.key.name(e.key).upper()
+                    if name in CLASS_NAMES:
+                        x = to_mnist(pad)
+                        if x is not None:
+                            c = CLASS_NAMES.index(name); taught[c].append(x); pad[:] = 0
+                            flash = f"example {len(taught[c])} of {name} added"; flash_t = time.perf_counter()
             if e.type == pygame.MOUSEBUTTONDOWN and pad_rect.collidepoint(e.pos):
                 if e.button == 3: pad[:] = 0
-                else: drawing = True
+                else: drawing = True; last_xy = None
             if e.type == pygame.MOUSEBUTTONUP: drawing = False
         if drawing:
             mx, my = pygame.mouse.get_pos()
             if pad_rect.collidepoint(mx, my):
-                yy, xx = np.ogrid[:280, :280]
-                pad[:] = np.maximum(pad, np.clip(1.5 - np.hypot(yy - (my - pad_rect.y), xx - (mx - pad_rect.x)) / 9, 0, 1))
+                xy = (mx - pad_rect.x, my - pad_rect.y)
+                draw_stroke([last_xy or xy, xy]); last_xy = xy
         now = time.perf_counter()
         if not paused or now - last_call > 1.0:                        # paused: lr 0 calls keep the weights alive
-            if pos + nmb * B > len(Xtr): perm = rng.permutation(len(Xtr)); pos = 0
-            idx = perm[pos:pos + nmb * B]
-            model, st = t.run(Xtr, ytr, idx, init=init, seed=seed, lr=0.0 if paused else cur_lr); last_call = now
+            X, y, idx = batch()
+            model, st = t.run(X, y, idx, init=init, seed=seed, lr=0.0 if paused else cur_lr); last_call = now
             if not st[2] and not init: init = True; continue
             init = False
             if not paused:
-                pos += nmb * B; seen += nmb * B; npu_ms.append(t.ms)
+                seen += nmb * B; npu_ms.append(t.ms)
                 hist.append((seen, model.accuracy(Xte[sub], yte[sub])))
         screen.fill((16, 16, 20))
-        if model is not None:
-            screen.blit(weights_surface(model), (24, 24))
-            gx, gy, gw, gh = 770, 70, 480, 220
-            pygame.draw.rect(screen, (60, 60, 70), (gx, gy, gw, gh), 1)
-            for a in (0.9, 0.95, 1.0):
-                yy = gy + gh - (a - 0.8) / 0.2 * gh
-                pygame.draw.line(screen, (45, 45, 55), (gx, yy), (gx + gw, yy)); screen.blit(font.render(f"{a:.0%}", True, (120, 120, 130)), (gx - 50, yy - 8))
-            lx = lambda n: gx + (np.log10(max(n, 1000)) - 3) / (np.log10(max(hist[-1][0] if hist else 1, 600000)) - 3) * gw
-            for n_, lab_ in ((1000, "1k"), (10000, "10k"), (60000, "1 epoch"), (600000, "10 epochs")):
-                if hist and lx(n_) + 8 * len(lab_) <= gx + gw: screen.blit(font.render(lab_, True, (110, 110, 120)), (lx(n_) - 10, gy + gh + 4))
-            if len(hist) > 1:
-                pts = [(lx(s_), gy + gh - min(max((a_ - 0.8) / 0.2, 0), 1) * gh) for s_, a_ in hist]
-                pygame.draw.lines(screen, (90, 200, 255), False, pts, 2)
-            acc = hist[-1][1] if hist else 0
-            screen.blit(big.render(f"{acc * 100:.1f}%", True, (240, 240, 240)), (gx, 12))
-            screen.blit(font.render("test accuracy, images seen (log scale)", True, (140, 140, 150)), (gx + 200, 34))
-            ms = np.mean(npu_ms[-20:]) if npu_ms else 0
-            info = f"{seen / 60000:.2f} epochs in {now - t0:.1f} s   NPU {ms:.1f} ms per {nmb * B} images   lr {cur_lr:g}" + ("   PAUSED" if paused else "")
-            screen.blit(font.render(info, True, (200, 200, 200)), (724, gy + gh + 30))
-            screen.blit(font.render("draw a digit (right click / C clears)   SPACE pause   R restart   +/- lr", True, (150, 150, 160)), (724, 668))
-            screen.blit(font.render("first-layer weights of the 256 hidden units, one core owns 8 of them", True, (140, 140, 150)), (24, 700))
-            pygame.draw.rect(screen, (40, 40, 48), pad_rect)
-            surf = pygame.surfarray.make_surface(np.transpose(np.repeat((pad * 255).astype(np.uint8)[:, :, None], 3, 2), (1, 0, 2)))
-            screen.blit(surf, pad_rect.topleft)
-            x = pad_input()
-            if x is not None:
-                z = model.logits(x)[0]; p = np.exp(z - z.max()); p /= p.sum()
-                for d in range(10):
-                    yb = 352 + d * 28
-                    pygame.draw.rect(screen, (90, 200, 255) if d == p.argmax() else (70, 90, 110), (750, yb + 4, int(p[d] * 130), 18))
-                    screen.blit(font.render(str(d), True, (220, 220, 220)), (730, yb + 4))
-                screen.blit(big.render(str(int(p.argmax())), True, (255, 220, 120)), (1200, 362))
+        if model is None: pygame.display.flip(); continue
+        screen.blit(weights_surface(model), (24, 24))
+        screen.blit(small.render("first-layer weights of the 256 hidden units; core k owns units 8k..8k+7", True, (140, 140, 150)), (24, 700))
+        gx, gy, gw, gh = 770, 70, 480, 200
+        pygame.draw.rect(screen, (60, 60, 70), (gx, gy, gw, gh), 1)
+        for a in (0.9, 0.95, 1.0):
+            yy = gy + gh - (a - 0.8) / 0.2 * gh
+            pygame.draw.line(screen, (45, 45, 55), (gx, yy), (gx + gw, yy)); screen.blit(font.render(f"{a:.0%}", True, (120, 120, 130)), (gx - 50, yy - 8))
+        lx = lambda n: gx + (np.log10(max(n, 1000)) - 3) / (np.log10(max(hist[-1][0] if hist else 1, 600000)) - 3) * gw
+        for n_, lab_ in ((1000, "1k"), (10000, "10k"), (60000, "1 epoch"), (600000, "10 epochs")):
+            if hist and lx(n_) + 8 * len(lab_) <= gx + gw: screen.blit(font.render(lab_, True, (110, 110, 120)), (lx(n_) - 10, gy + gh + 4))
+        if len(hist) > 1:
+            pts = [(lx(s_), gy + gh - min(max((a_ - 0.8) / 0.2, 0), 1) * gh) for s_, a_ in hist]
+            pygame.draw.lines(screen, (90, 200, 255), False, pts, 2)
+        acc = hist[-1][1] if hist else 0
+        screen.blit(big.render(f"{acc * 100:.1f}%", True, (240, 240, 240)), (gx, 12))
+        screen.blit(small.render("MNIST test accuracy, images seen (log)", True, (140, 140, 150)), (gx + 200, 38))
+        ms = np.mean(npu_ms[-20:]) if npu_ms else 0
+        info = f"{seen / 60000:.1f} epochs in {now - t0:.0f} s   NPU {ms:.1f} ms per call of {nmb * B} images   lr {cur_lr:g}" + ("   PAUSED" if paused else "")
+        screen.blit(font.render(info, True, (200, 200, 200)), (724, gy + gh + 30))
+        nt = {CLASS_NAMES[c]: len(v) for c, v in taught.items() if v}
+        screen.blit(font.render("taught: " + ("  ".join(f"{k} x{v}" for k, v in nt.items()) if nt else "nothing yet (draw, then press A-F or a digit)"), True, (200, 180, 120)), (724, gy + gh + 54))
+        if flash and now - flash_t < 2: screen.blit(font.render(flash, True, (255, 220, 120)), (930, 330))
+        pygame.draw.rect(screen, (40, 40, 48), pad_rect)
+        surf = pygame.surfarray.make_surface(np.transpose(np.repeat((pad * 255).astype(np.uint8)[:, :, None], 3, 2), (1, 0, 2)))
+        screen.blit(surf, pad_rect.topleft)
+        screen.blit(small.render("draw; A-F teaches a new symbol, 0-9 a digit", True, (150, 150, 160)), (724, 650))
+        screen.blit(small.render("right click / backspace clears, SPACE pause, R restart, +/- lr", True, (150, 150, 160)), (724, 670))
+        x = to_mnist(pad)
+        if x is not None:
+            z = model.logits(x[None])[0]; p = np.exp(z - z.max()); p /= p.sum()
+            for d in range(NOUT):
+                yb = 352 + d * 17
+                pygame.draw.rect(screen, (90, 200, 255) if d == p.argmax() else (70, 90, 110), (750, yb + 3, int(p[d] * 150), 12))
+                screen.blit(small.render(CLASS_NAMES[d], True, (220, 220, 220)), (730, yb))
+            screen.blit(big.render(CLASS_NAMES[int(p.argmax())], True, (255, 220, 120)), (1222, 362))
         pygame.display.flip()
 
 
