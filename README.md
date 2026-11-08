@@ -76,9 +76,9 @@ soundfile and sounddevice, the live ones headphones.
 | ![SDF](docs/img/sdf64.png) SDF sphere tracer | ![Blobs](docs/img/blob48.png) Smooth-min blobs | ![Mandelbrot](docs/img/mandel.png) Mandelbrot, 32 cores |
 | ![Sandpile](docs/img/sandpile.png) Abelian sandpile, 2^18 grains | ![Gray-Scott](docs/img/grayscott.png) Gray-Scott coral | ![YOLO](docs/img/yolo_coco.png) YOLO26n, 150 fps, real weights |
 | ![Cyclic](docs/img/spiral_cyclic.png) Cyclic CA demons | ![GH](docs/img/spiral_gh.png) Greenberg-Hastings spirals | ![Plasma](docs/img/plasma.png) 1080p plasma, 0.34 ms/frame |
-| ![Room](docs/img/room.png) Corridor impulse response, 3-D FDTD | | |
+| ![Room](docs/img/room.png) Corridor impulse response, 3-D FDTD | ![Style](docs/img/style_coco.png) Neural style transfer, 5 styles, 16.7 ms/frame | |
 
-(The YOLO picture is COCO 2017 image 30: photo by julie, https://www.flickr.com/photos/roosterfarm/3573516590, CC BY 2.0, boxes added.)
+(The YOLO and style pictures are COCO 2017 image 30: photo by julie, https://www.flickr.com/photos/roosterfarm/3573516590, CC BY 2.0, boxes added / restyled by the NPU.)
 
 ## Hardware (xrt-smi: "NPU Krackan 1", aie2p, 6x8)
 
@@ -122,6 +122,7 @@ stated, min or median after a warm-up call, host wall clock from Python unless t
 | Lenia 512x512, 27x27 kernel (729 taps/cell), int16 Q15 | 0.65-0.84 ms/step, 1200-1500 steps/s, ~250 GMAC/s, conv exact to 6 LSB (`fun/lenia.py`) |
 | DX7 FM synth, 512 voices x 6 operators, 256-sample blocks | 0.5 ms per block (5.3 ms of audio), 1.6 G operator-samples/s, bit-exact replica (`fun/dx7.py`) |
 | NAM guitar amp (WaveNet, 13320 MAC/sample), 64-sample blocks, 16 cores per amp | 0.54 ms per block (1.33 ms of audio) for two amps at once, 65.9 dB SNR vs the float32 model with bf16 hi+lo pairs, 48 dB with single bf16 weights; live at 1.3 ms blocks, no underruns (`fun/nam_amp.py`) |
+| Fast neural style transfer (Johnson TransformerNet, 1.68 M params, 13.8 GMAC per 320x240 frame), int8, 31 phases on 32 cores in one dispatch | **16.7 ms per frame on the NPU**, 18.6 ms (54 fps) for the whole Python call with upload and readback; 45-52 dB PSNR from a numpy emulation of the int8 design, which is 27-45 dB from the float32 model depending on the style (`fun/style_cam.py`) |
 | Additive synth, 3072 partials, 1024-sample blocks | 0.38 ms per block (21 ms of audio: 56x real time for all 3072 partials) = 8 G partial-samples/s, amplitude drift-free, 0.03 Hz tuning (`fun/additive.py`) |
 | Binaural, 32 sources x 2 ears x 160 taps, 1024-sample blocks | 0.28 ms per block (dispatch-bound), bit-exact, 38x real time (`fun/binaural.py`) |
 | conv2d engine 512x512: K=3 / 7 / 15 | 0.27 / 0.35 / 0.91 ms per pass, 1-4 LSB vs numpy (`fun/conv2d.py`) |
@@ -170,6 +171,7 @@ Batch work per dispatch; keep one call per frame.
 | `patterns.py` | RLE helper with the classic Life objects for `life_window.py` (no main) |
 | `dx7.py` | DX7-style FM synth: 512 six-operator voices, voices in the lanes, sine through the lookup unit, the 32 algorithms as data; `--window` plays it from the keyboard, bit-exact numpy replica, `dx7_demo.wav` |
 | `nam_amp.py` | Neural Amp Modeler guitar amps (`.nam` WaveNet captures) as a 16-core pipeline per amp, two amps at once; `--wav` renders a DI through amp and cab IR, `--live` is mic/line in to speakers at 1.3 ms blocks, `--selftest` / `--stages` compare with a float32 reference per core; see the section |
+| `style_cam.py` | fast neural style transfer (the five pytorch/examples styles from the ONNX zoo) as an int8 31-phase pipeline in one dispatch; `--window` live webcam (keys 1-5 pick the style, 0 shows the input), `--image` restyles a picture, `--selftest` checks every style against the int8 emulation, float32 and onnxruntime, `--phases N --check` one phase at a time; see the section |
 | `probe/plasma.py` | 3-sine plasma, `--window` |
 | `physarum_route.py` | slime-mould router for KiCad boards (Tero's Physarum solver, every net a tube network competing for space); `--window` / `--video` show the tubes grow, `--write-pcb` writes the tubes as tracks and vias into a copy of the board (opens in KiCad), `--write-pro` writes topor priority net classes. CPU only (sparse direct solves), see the section |
 
@@ -184,6 +186,8 @@ Batch work per dispatch; keep one call per frame.
 | `lut.py` | `aie::parallel_lookup` against a scalar gather loop (palettes, textures) |
 | `vtanh.py` | the AIE2P hardware tanh (`aie::tanh`, bf16 out) against numpy: it returns its argument unchanged for abs(x) <= 0.5 and is 4-20 bf16 ulps off elsewhere, which is why `nam_amp.py` uses a table instead |
 | `nam_torch_check.py` | the float32 NAM reference in `fun/nam_amp.py` against the official neural-amp-modeler torch code (run it yourself; the sandbox here does not execute downloaded packages) |
+| `mmul_i8.py` | `aie::mmul<8,8,8,int8,int8>` as a 3-tap row convolution: operand layouts checked against numpy and the cost per mmul (1.6 cycles = 320 MAC/cycle with aligned loads and `shuffle_down_fill`; `mmul<8,16,8>` wants a sparse B) |
+| `style_loop.py` | a core driven by a run-time table: `if_` on a segment kind, `range_` with trip counts loaded from a `Buffer`, dynamic ObjectFifo lowering, three kernel entry points from one source; object order check and the cost of a step (0.42 us broadcast, 1.0 us split) |
 | `fir_check.py`, `fir_floor.py`, `fir_alt.py`, `gs_check.py`, `ising_check.py` | static schedule (II, libcalls, stack) reports for the FIR, Gray-Scott and Ising kernels; where the reverb's time goes |
 | `lbm_check.py`, `lenia_dbg.py`, `lenia_dbg2.py`, `room_decay.py`, `room_rounding.py`, `slime_stats.py` | the debugging runs behind the lessons in this README (numpy emulations of rounding, mass and energy checks) |
 
@@ -437,6 +441,59 @@ fixed with one generic `layer()` over a descriptor table; and pass-through cores
 forward the partial-accumulator payload too, or be placed where none is in flight (the first version only worked
 by accident of buffer placement).
 
+## Webcam style transfer: a 31-phase int8 network in one dispatch
+
+![style](docs/img/style_coco.png)
+
+`fun/style_cam.py` runs Johnson, Alahi and Fei-Fei's fast style transfer network (the pytorch/examples
+TransformerNet, here the five ONNX model zoo exports: mosaic, candy, rain princess, udnie, pointilism): a 9x9 conv
+to 32 channels, two stride-2 3x3 convs to 128, five residual blocks of two 3x3 convs, two nearest-upsample 3x3
+convs back to 32 and a 9x9 conv to RGB, reflection padding everywhere and instance normalisation + ReLU after every
+conv but the last. 1.68 M parameters, 13.8 GMAC for a 320x240 frame. The webcam frame goes in, the painting comes
+out, **16.7 ms per frame** on the NPU (54 fps for the whole Python call), switching styles costs nothing (the
+weights are a runtime buffer per style).
+
+What makes it hard is not the arithmetic (0.77 ms of int8 mmul at the measured 320 MAC/cycle per core) but that
+nothing fits: activations up to 2.4 MB, weights 2.4 MB, 64 KB per core and 16 KB of program memory. So the whole
+network is one dispatch of **31 phases** (16 convs, 15 norms) over a 20 MB DDR scratch buffer, every phase on all 32
+cores:
+
+* **conv phase**: a column takes a band of output rows; the shim streams the band's row windows (all input channels
+  of one row, 40 output pixels plus the kernel margin) through a memtile broadcast to its 4 cores, which hold
+  different 16-channel output groups (8 for the 32-channel layers; in the last layer, different tile columns).
+  The core keeps a ring of the last K rows (stride-2 rows de-interleaved into even and odd pixels, upsampled rows
+  as the two low-resolution rows they come from), runs `aie::mmul<8,8,8,int8,int8>` over taps and channel blocks
+  with int32 accumulation, and writes an int16 raw tile-row plus running per-channel sums of `(raw - m0)` and its
+  square. Reflection padding is in the DMA patterns (rows) and the row copy (columns).
+* **norm phase**: every core reads the 32 conv cores' statistics, turns them into a per-channel scale and shift
+  (fp32 math done as three bf16 macs on hi/lo limbs, Newton `rsqrt`), and normalises its channels' raw tile-rows,
+  with ReLU, the residual add and requantisation to int8 planar activations.
+
+Everything a core does comes from one generic loop over a **segment table** with run-time trip counts (rows only:
+weights, constants, statistics, residual rows; rows + out: a conv line; out + m rows: a norm tile or a last-layer
+line); the kernel keeps its own phase and step counters and decides what each object is. The first version unrolled
+the per-core schedule into the worker body and needed 21 KB of program memory for one phase. Activations are signed
+int8 throughout: post-ReLU tensors are stored as `q - 128`, which adds a per-channel constant to the next conv that
+the instance norm removes again (and that is folded into the last layer's bias), so one mmul type serves every
+layer. The quantisation is per channel (weights folded with the input scale, activations at the 99.99th percentile
+of five COCO calibration images, a per-layer shift for the int16 raw).
+
+Checking: `--phases N --check` builds the first N phases and compares the last with a numpy emulation of exactly
+this arithmetic. conv1 is bit-exact, norm phases are within 1 LSB (fp32 limbs vs float64), and every conv is
+bit-exact when the emulator is fed the NPU's own input tensor; what grows through the residual blocks is those
+1-LSB rounding flips. End to end the NPU is 45-52 dB from the emulation, and the emulation is 27-45 dB from the
+float32 model (mosaic, whose glass pattern is chaotic, 27 dB on the test picture; udnie 44.5 dB); that last
+number is the int8 design itself, a 16-bit raw shift or other headrooms change it by 0.3 dB. The float32 numpy
+reference is 86-93 dB from onnxruntime.
+
+Costs that are left: 123 MB in and 65 MB out of DDR per frame (a 5632-byte object for every row window, which
+wastes most of it for the 8-channel input of conv1 and the 32-channel layers), 1632 DMA transfers. Live, the
+laptop camera is the limit at night (12.5 fps alone, 9.5 fps with the NPU call holding the GIL).
+
+Bugs that cost a run each: a 352-byte stride with `aie::load_v<64>` (rounds the address down, see the gotcha) broke
+the residual add only; an unmanaged runtime transfer starts itself, so a `.start()` on top ran every DMA twice;
+and IRON packs two columns' transfers onto one shim unless the runtime endpoints are pinned (`prod(tile=Tile(c, 0))`).
+
 ## Room acoustics -> impulse response -> reverb (a chain)
 
 `fun/room.py` simulates a 2.7 x 2.7 x 11 m hard-walled corridor with the 3-D wave equation (7-point
@@ -647,6 +704,12 @@ pad-to-pad distance and how much competition it meets along the way, binned into
 * `docs/img/yolo_coco.png` is COCO 2017 image 30 (coco128) with the NPU's boxes drawn on it:
   "Untitled" by julie (flickr.com/photos/roosterfarm/3573516590), CC BY 2.0, modified (boxes and
   labels added); COCO itself: Lin et al. 2014, annotations CC BY 4.0.
+* `docs/img/style_coco.png` is the same photo restyled by the NPU. The five style networks are the
+  [pytorch/examples fast_neural_style](https://github.com/pytorch/examples/tree/main/fast_neural_style) models
+  (BSD-3-Clause) as exported to the [ONNX Model Zoo](https://github.com/onnx/models/tree/main/validated/vision/style_transfer/fast_neural_style)
+  (BSD-3-Clause); they are not in this repo. Method: Johnson, Alahi, Fei-Fei, "Perceptual Losses for Real-Time
+  Style Transfer and Super-Resolution" (2016), instance normalisation from Ulyanov, Vedaldi, Lempitsky (2016).
+  `fun/style_cam.py` reads the ONNX weights with the `onnx` package and contains no code from either repo.
 * Measurements and findings quoted from
   [ghost-intuit/xdna2-npu-experiments](https://github.com/ghost-intuit/xdna2-npu-experiments)
   are theirs, CC BY 4.0.
@@ -721,6 +784,25 @@ Code counts too: a core with seven unrolled layers failed to link ("section '.te
 Between adjacent cores an ObjectFifo's buffer is allocated once, on the producer tile; the consumer reads it over
 the neighbour window. Across columns (DMA) both sides hold a copy. Plan memory accordingly (`input_with_addresses.mlir`
 in the cache directory lists every buffer with its tile).
+
+### Unrolled worker bodies eat program memory
+
+A Worker body is code: every `acquire`, `release` and kernel call in Python becomes instructions in the core's 16 KB
+program memory, next to the kernel. A per-core schedule of a few hundred calls per phase did not link
+(`.text` over by 18 KB for one phase of 31). Drive the core from a table instead: a `Buffer` with the segments,
+`for s in range_(N)`, the trip count `arith.index_cast(IndexType.get(), tab[2 * s + 1])`, `with if_(...)` on the
+kind, and `Worker(..., dynamic_objfifo_lowering=True)` so acquires inside run-time loops keep a run-time buffer
+index; the kernel counts its own steps. `probe/style_loop.py`.
+
+### Shim DMA: 16 BDs per tile, inner dimension up to 1023 words
+
+A runtime transfer whose innermost size exceeds 1023 words (a 5632-byte object is 1408) is split by the compiler
+into one BD per outer index, and a few of those exhaust the shim's 16 buffer descriptors ("Too many simultaneously
+active buffer descriptors"). Split the inner run yourself (`[2][704]`) into a spare dimension, drop size-1 dims,
+and keep a bounded number of transfers in flight per shim: issue the drains first, then the fills, awaiting the
+oldest fill when the cap is reached (`managed=False` transfers start themselves; `await_()` frees their BDs; managed
+ones are awaited when their TaskGroup closes). Pin each column's runtime endpoints to its own shim
+(`fifo.prod(tile=Tile(c, 0))`), or two columns may share one tile's BDs.
 
 ### Static schedule check before hardware
 
