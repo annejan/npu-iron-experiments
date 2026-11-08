@@ -589,7 +589,9 @@ over 6000 updates (18 million moves, 5 minutes), after which the policy collapse
 for returns that made the shortcut version stable do not prevent the collapse here. An entropy bonus computed on the
 NPU does (`--entropy 0.01`; the gradient of the policy's entropy needs no logarithm, since `p_j (ln p_j + H)` equals
 `ln2 p_j (t_j - sum_k p_k t_k)` with `t` the `exp2` argument the softmax already has): over 6000 updates the policy
-dips and recovers instead of freezing, but it stays near 0.5 returns per point. `--play w.npz` puts you on the left
+dips and recovers instead of freezing, but it stays near 0.5 returns per point. Drawing the ball as a 3x3 block in
+the input made it rise faster (0.77 at 1400 updates) and then swing back to 0.3: with this perceptron and plain
+REINFORCE, tracking a ball from pixels is the sample-hungry, unstable problem it is known to be. `--play w.npz` puts you on the left
 paddle against saved weights (CPU inference), which makes the shortcut obvious.
 
 ## Room acoustics -> impulse response -> reverb (a chain)
