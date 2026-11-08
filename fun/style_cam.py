@@ -1258,7 +1258,7 @@ def main():
         while not stop[0]:
             f = grab()
             if f is not None: latest[0] = f
-    threading.Thread(target=reader, daemon=True).start()
+    reader_thread = threading.Thread(target=reader, daemon=True); reader_thread.start()
     vcam = None
     if a.vcam:
         vw, vh = map(int, a.vcam_size.lower().split("x")); vcam = VirtualCam(a.vcam, vw, vh)
@@ -1269,8 +1269,11 @@ def main():
         screen = pygame.display.set_mode((W * scale, H * scale)); font = pygame.font.SysFont(None, 24)
     n, t0, show_in = 0, time.perf_counter(), False
     style = max(0, min(len(npu.nets) - 1, a.style - 1)); t_style = t0; t_print = t0
+    import signal                                                 # Ctrl-C only sets a flag: an exception raised inside
+    quit_ = [False]                                               # npu.run aborts XRT ("xrt::run destructed while ...")
+    signal.signal(signal.SIGINT, lambda *_: quit_.__setitem__(0, True))
     try:
-        while True:
+        while not quit_[0]:
             if a.window:
                 for e in pygame.event.get():
                     if e.type == pygame.QUIT or (e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE): return
@@ -1294,7 +1297,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        stop[0] = True
+        stop[0] = True                                            # stop the reader before the interpreter exits:
+        reader_thread.join(timeout=2); cap.release()              # a thread left inside cap.read() aborts the process
         if vcam: vcam.close()
 
 
