@@ -509,6 +509,11 @@ and IRON packs two columns' transfers onto one shim unless the runtime endpoints
 
 ![mnist](docs/img/mnist_npu.png)
 
+![learning](docs/img/mnist_learning.gif)
+
+(64 of the 256 hidden units' input weights during the first two epochs, one frame per 3008 images: random noise
+turning into stroke detectors.)
+
 An NPU is built to run networks that were trained elsewhere. `fun/mnist_npu.py` trains one on it: a 784-256-10
 perceptron (ReLU, softmax cross-entropy, plain SGD, minibatch 64) on MNIST, forward pass, backward pass and weight
 update all on the chip, **one dispatch per epoch, 49.5 ms** with the clocks warm and the stream already in place
