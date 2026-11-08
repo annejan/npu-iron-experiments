@@ -76,7 +76,7 @@ soundfile and sounddevice, the live ones headphones.
 | ![SDF](docs/img/sdf64.png) SDF sphere tracer | ![Blobs](docs/img/blob48.png) Smooth-min blobs | ![Mandelbrot](docs/img/mandel.png) Mandelbrot, 32 cores |
 | ![Sandpile](docs/img/sandpile.png) Abelian sandpile, 2^18 grains | ![Gray-Scott](docs/img/grayscott.png) Gray-Scott coral | ![YOLO](docs/img/yolo_coco.png) YOLO26n, 150 fps, real weights |
 | ![Cyclic](docs/img/spiral_cyclic.png) Cyclic CA demons | ![GH](docs/img/spiral_gh.png) Greenberg-Hastings spirals | ![Plasma](docs/img/plasma.png) 1080p plasma, 0.34 ms/frame |
-| ![Room](docs/img/room.png) Corridor impulse response, 3-D FDTD | ![Style](docs/img/style_coco.png) Neural style transfer, 5 styles, 16.7 ms/frame | |
+| ![Room](docs/img/room.png) Corridor impulse response, 3-D FDTD | ![Style](docs/img/style_coco.png) Neural style transfer, 5 styles, 16.7 ms/frame | ![MNIST](docs/img/mnist_npu.png) The NPU learns MNIST, 80 ms/epoch |
 
 (The YOLO and style pictures are COCO 2017 image 30: photo by julie, https://www.flickr.com/photos/roosterfarm/3573516590, CC BY 2.0, boxes added / restyled by the NPU.)
 
@@ -123,6 +123,7 @@ stated, min or median after a warm-up call, host wall clock from Python unless t
 | DX7 FM synth, 512 voices x 6 operators, 256-sample blocks | 0.5 ms per block (5.3 ms of audio), 1.6 G operator-samples/s, bit-exact replica (`fun/dx7.py`) |
 | NAM guitar amp (WaveNet, 13320 MAC/sample), 64-sample blocks, 16 cores per amp | 0.54 ms per block (1.33 ms of audio) for two amps at once, 65.9 dB SNR vs the float32 model with bf16 hi+lo pairs, 48 dB with single bf16 weights; live at 1.3 ms blocks, no underruns (`fun/nam_amp.py`) |
 | Fast neural style transfer (Johnson TransformerNet, 1.68 M params, 13.8 GMAC per 320x240 frame), int8, 31 phases on 32 cores in one dispatch | **16.7 ms per frame on the NPU**, 18.6 ms (54 fps) for the whole Python call with upload and readback; 45-52 dB PSNR from a numpy emulation of the int8 design, which is 27-45 dB from the float32 model depending on the style (`fun/style_cam.py`) |
+| MNIST training (784-256-10 MLP, bf16 matmuls, fp32 master weights resident in L1, model parallel over 32 cores), 937 minibatches of 64 per dispatch | **80 ms per epoch** on the NPU (numpy fp32 on the CPU: 280 ms), 96.5% test accuracy after one epoch, 97.9% after five (numpy, same setup: 96.7 / 97.9); initialisation bit-exact, one SGD step within 1-3% of a bf16 numpy replica (`fun/mnist_npu.py`) |
 | Additive synth, 3072 partials, 1024-sample blocks | 0.38 ms per block (21 ms of audio: 56x real time for all 3072 partials) = 8 G partial-samples/s, amplitude drift-free, 0.03 Hz tuning (`fun/additive.py`) |
 | Binaural, 32 sources x 2 ears x 160 taps, 1024-sample blocks | 0.28 ms per block (dispatch-bound), bit-exact, 38x real time (`fun/binaural.py`) |
 | conv2d engine 512x512: K=3 / 7 / 15 | 0.27 / 0.35 / 0.91 ms per pass, 1-4 LSB vs numpy (`fun/conv2d.py`) |
@@ -172,6 +173,7 @@ Batch work per dispatch; keep one call per frame.
 | `dx7.py` | DX7-style FM synth: 512 six-operator voices, voices in the lanes, sine through the lookup unit, the 32 algorithms as data; `--window` plays it from the keyboard, bit-exact numpy replica, `dx7_demo.wav` |
 | `nam_amp.py` | Neural Amp Modeler guitar amps (`.nam` WaveNet captures) as a 16-core pipeline per amp, two amps at once; `--wav` renders a DI through amp and cab IR, `--live` is mic/line in to speakers at 1.3 ms blocks, `--selftest` / `--stages` compare with a float32 reference per core; see the section |
 | `style_cam.py` | fast neural style transfer (the five pytorch/examples styles from the ONNX zoo) as an int8 31-phase pipeline in one dispatch; `--window` live webcam (keys 1-5 pick the style, 0 shows the input), `--vcam /dev/video10` feeds a v4l2loopback virtual camera for video calls (load the module with `exclusive_caps=1`; `--cycle 20` rotates the styles), `--image` restyles a picture, `--selftest` checks every style against the int8 emulation, float32 and onnxruntime, `--phases N --check` one phase at a time; see the section |
+| `mnist_npu.py` | the NPU trains a neural network: MNIST, forward and backward pass and SGD update on all 32 cores, weights never leave the chip; `--epochs N`, `--selftest`, `--window` shows the first-layer weights forming and the accuracy climbing, and classifies what you draw with the live weights; see the section |
 | `probe/plasma.py` | 3-sine plasma, `--window` |
 | `physarum_route.py` | slime-mould router for KiCad boards (Tero's Physarum solver, every net a tube network competing for space); `--window` / `--video` show the tubes grow, `--write-pcb` writes the tubes as tracks and vias into a copy of the board (opens in KiCad), `--write-pro` writes topor priority net classes. CPU only (sparse direct solves), see the section |
 
@@ -503,6 +505,41 @@ Bugs that cost a run each: a 352-byte stride with `aie::load_v<64>` (rounds the 
 the residual add only; an unmanaged runtime transfer starts itself, so a `.start()` on top ran every DMA twice;
 and IRON packs two columns' transfers onto one shim unless the runtime endpoints are pinned (`prod(tile=Tile(c, 0))`).
 
+## The NPU learns: MNIST training on 32 cores
+
+![mnist](docs/img/mnist_npu.png)
+
+An NPU is built to run networks that were trained elsewhere. `fun/mnist_npu.py` trains one on it: a 784-256-10
+perceptron (ReLU, softmax cross-entropy, plain SGD, minibatch 64) on MNIST, forward pass, backward pass and weight
+update all on the chip, **one dispatch per epoch, 80 ms** (numpy in float32 on the laptop's CPU: 280 ms). Accuracy
+follows the float32 reference: 96.5% on the test set after one epoch, 97.9% after five (numpy with the same
+initialisation and learning rate: 96.7 and 97.9).
+
+The split is model parallel. Core k of a snake through the 32 cores (so that chain neighbours share memory) owns
+hidden units 8k..8k+7: 784x8 of W1 and 8x10 of W2 as fp32 master weights in its L1 for the whole run (they are only
+dumped at the end of a call). The matmuls are `aie::mmul<8,8,8,bfloat16,bfloat16>` into fp32 accumulators, with
+every tile oriented so that almost nothing needs transposing:
+
+* forward, `H^T = W1^T X^T`: the images arrive as 8x8 tiles [batch][pixel] in 7 chunks of 112 pixels through one
+  memtile broadcasting to all 32 cores, and the kernel transposes each tile (`aie::transpose`, one instruction);
+* partial logits `P^T = W2^T relu(H^T)`, rows per class with the batch in the lanes, written into the core's own
+  outgoing buffer; the hop down the snake is then only an add of the running sum;
+* the last core adds the bias, takes the softmax (`aie::exp2` and `aie::inv` in bf16, the exponent argument as
+  hi + lo bf16 limbs), and broadcasts `G = -lr/B (p - onehot)` to every core;
+* backward: `dh^T = W2 G` masked by the ReLU, `W2 += G h`, the bias gradients as a mmul with a tile of ones (which
+  yields the row sums already replicated across the lanes the forward pass wants), and, while the same images stream
+  in again, `W1^T += dh^T X`.
+
+Checks (`--selftest`): the xorshift initialisation and the dump are bit-exact against a numpy replica; one SGD step
+agrees with a numpy replica that rounds to bf16 where the chip does within 1-3% (the rest is the bf16 `exp2`/`inv`);
+the count of correct answers per minibatch matches. `--window` shows the first-layer weights turning into stroke
+detectors and the accuracy climbing (ten epochs in about 12 s, the display and the host's evaluation included), and
+classifies what you draw with the mouse using the weights the chip has at that moment.
+
+Where the 80 ms go: without the matmuls it is still 60 ms. Most of it is the input: every minibatch reaches all 32
+cores twice (107 KB) through one shim channel, which carries about 4 GB/s. The first version also did the chain hop
+after computing the partial logits, which made 31 hops of compute sequential (92 ms per epoch).
+
 ## Room acoustics -> impulse response -> reverb (a chain)
 
 `fun/room.py` simulates a 2.7 x 2.7 x 11 m hard-walled corridor with the 3-D wave equation (7-point
@@ -713,6 +750,9 @@ pad-to-pad distance and how much competition it meets along the way, binned into
 * `docs/img/yolo_coco.png` is COCO 2017 image 30 (coco128) with the NPU's boxes drawn on it:
   "Untitled" by julie (flickr.com/photos/roosterfarm/3573516590), CC BY 2.0, modified (boxes and
   labels added); COCO itself: Lin et al. 2014, annotations CC BY 4.0.
+* MNIST (`fun/mnist_npu.py`): Yann LeCun, Corinna Cortes, Christopher J.C. Burges, CC BY-SA 3.0; downloaded to
+  `~/models/mnist` from the TensorFlow mirror, not redistributed. `docs/img/mnist_npu.png` shows weights learned
+  from it and a hand-drawn (synthetic) 7, no MNIST images.
 * `docs/img/style_coco.png` is the same photo restyled by the NPU. The five style networks are the
   [pytorch/examples fast_neural_style](https://github.com/pytorch/examples/tree/main/fast_neural_style) models
   (BSD-3-Clause) as exported to the [ONNX Model Zoo](https://github.com/onnx/models/tree/main/validated/vision/style_transfer/fast_neural_style)
