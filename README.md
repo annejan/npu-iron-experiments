@@ -174,7 +174,8 @@ Batch work per dispatch; keep one call per frame.
 | `patterns.py` | RLE helper with the classic Life objects for `life_window.py` (no main) |
 | `dx7.py` | DX7-style FM synth: 512 six-operator voices, voices in the lanes, sine through the lookup unit, the 32 algorithms as data; `--window` plays it from the keyboard, bit-exact numpy replica, `dx7_demo.wav` |
 | `nam_amp.py` | Neural Amp Modeler guitar amps (`.nam` WaveNet captures) as a 16-core pipeline per amp, two amps at once; `--wav` renders a DI through amp and cab IR, `--live` is mic/line in to speakers at 1.3 ms blocks, `--selftest` / `--stages` compare with a float32 reference per core; see the section |
-| `style_cam.py` | fast neural style transfer (the five pytorch/examples styles from the ONNX zoo) as an int8 31-phase pipeline in one dispatch; `--window` live webcam (keys 1-5 pick the style, 0 shows the input), `--vcam /dev/video10` feeds a v4l2loopback virtual camera for video calls (load the module with `exclusive_caps=1`; `--cycle 20` rotates the styles), `--image` restyles a picture, `--selftest` checks every style against the int8 emulation, float32 and onnxruntime, `--phases N --check` one phase at a time; see the section |
+| `style_cam.py` | fast neural style transfer (the five pytorch/examples styles from the ONNX zoo) as an int8 31-phase pipeline in one dispatch; `--window` live webcam (keys 1-5 pick the style, 0 shows the input), `--vcam auto` feeds a v4l2loopback virtual camera for video calls (load the module with `exclusive_caps=1`; `--cycle 20` rotates the styles), `--image` restyles a picture, `--selftest` checks every style against the int8 emulation, float32 and onnxruntime, `--phases N --check` one phase at a time; see the section |
+| `style_tray.py` | the style camera as a tray icon (PyQt6, system Python): styles, cycling, preview, and the webcam and the NPU run only while an app streams from the virtual camera (v4l2loopback's client-usage event); see the style section |
 | `mnist_npu.py` | the NPU trains a neural network: MNIST, forward and backward pass and SGD update on all 32 cores, weights never leave the chip; `--epochs N`, `--selftest`, `--bench`, `--window` shows the first-layer weights forming and the accuracy climbing, classifies what you draw with the live weights, and learns new symbols you draw (keys A-F); see the section |
 | `pong_npu.py`, `breakout_npu.py` | the same trainer does REINFORCE: 128 games on the CPU, policy updates on the NPU; `--train N --gif x.gif --save w.npz`, `--window` to watch it learn, `--play w.npz` to play against what it learned; see the section for what it really learned |
 | `probe/plasma.py` | 3-sine plasma, `--window` |
@@ -497,8 +498,32 @@ plain `VIDIOC_S_FMT` ioctl and `write()`, no packages), so Zoom, Jitsi or a brow
 ```
 sudo zypper in v4l2loopback-kmp-default      # openSUSE; other distros: v4l2loopback-dkms
 sudo modprobe v4l2loopback video_nr=10 card_label="NPU Style" exclusive_caps=1
-./env.sh python fun/style_cam.py --vcam /dev/video10 --window
+./env.sh python fun/style_cam.py --vcam auto --window     # auto: the first loopback node, preferring "NPU" in its name
 ```
+
+Measured through a real loopback: a reader (ffmpeg, Chrome) gets 640x480 YU12 at 30 fps by day, with the NPU at
+16.2 ms per frame.
+
+<img src="docs/img/style_tray_menu.png" width="240" align="right" alt="the tray menu">
+
+As a tray icon, for daily use: `python3 fun/style_tray.py` (any Python with PyQt6, e.g. the system one; it starts the
+NPU part in ironenv through `./env.sh`). The menu has the five styles and the plain camera, cycling, a preview window
+(also a left click on the icon; a middle click picks the next style), stop/start and quit. The icon shows the live
+picture. The webcam and the NPU run only while an app streams from the virtual camera: v4l2loopback (0.15.4 here)
+sends the writer a private event, `V4L2_EVENT_PRIVATE_START + 0x08E00000 + 1`, with a count of 1 on a reader's
+`STREAMON` and 0 on its `STREAMOFF` or close. In between, the camera light is off and the loopback gets a still card
+at 5 fps, because apps list a v4l2loopback camera with `exclusive_caps=1` only while someone writes to it. When a call
+starts, the reader sees the card for about two seconds (the webcam opens on its own thread), then the live picture,
+with no gap over 0.2 s. After the NPU has idled (it autosuspends after 5 s), the first frame takes 150 ms and is
+bit-exact with one from a warm NPU. Idle, the NPU part uses 0.2% of a core. The card is converted to I420 once: converting it on each write cost 4%, because OpenCV's worker threads spin after every call. The two processes talk in JSON lines; frames for the icon and the preview go
+through a small file in `$XDG_RUNTIME_DIR` with a sequence counter around each frame.
+
+Two exits used to crash, and both are fixed in `style_cam.py` too: a camera reader thread still inside
+`cap.read()` at interpreter exit (`terminate called without an active exception`), and Ctrl-C raising
+`KeyboardInterrupt` inside an NPU call (`xrt::run destructed while command is still in progress`). The live loops now
+join the reader, and Ctrl-C only sets a flag. After a reboot, openSUSE's `v4l2loopback-autoload` loads the module as
+"OBS Virtual Camera" on the first free `/dev/video*`, which can come before the webcam. So the webcam is now found by
+its driver (never a loopback node, which would feed the filter its own output) instead of being index 0.
 
 Costs that are left: 123 MB in and 65 MB out of DDR per frame (a 5632-byte object for every row window, which
 wastes most of it for the 8-channel input of conv1 and the 32-channel layers), 1632 DMA transfers. Live, the

@@ -6,7 +6,7 @@ fast_neural_style models, here the ONNX zoo exports) as a 31-phase int8 pipeline
   ./env.sh python fun/style_cam.py --image in.jpg --out x.png  one picture, every style
   ./env.sh python fun/style_cam.py --window                    live webcam (keys 1..5 pick the style, 0 input, ESC)
   ./env.sh python fun/style_cam.py --bench                     NPU time per frame
-  ./env.sh python fun/style_cam.py --vcam /dev/video10         virtual webcam for Zoom/Jitsi/the browser (v4l2loopback),
+  ./env.sh python fun/style_cam.py --vcam auto                 virtual webcam for Zoom/Jitsi/the browser (v4l2loopback),
                                                                headless; add --window to watch, --cycle 20 to rotate styles
 
 The network: conv9x9 3->32, two stride-2 conv3x3 (->64, ->128), five residual blocks at 128 channels, two nearest-upsample
@@ -1116,15 +1116,54 @@ class StyleNPU:
 
 
 # ------------------------------------------------------------------------------------------------- virtual webcam
+def v4l2_devices():
+    """[(path, driver, card, device_caps)] for every /dev/video* that answers VIDIOC_QUERYCAP, in numeric order."""
+    import fcntl, glob, re, struct
+    out = []
+    for path in sorted(glob.glob("/dev/video*"), key=lambda p: int(re.sub(r"\D", "", p) or 0)):
+        try: fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+        except OSError: continue
+        try:
+            cap = bytearray(104); fcntl.ioctl(fd, VirtualCam.VIDIOC_QUERYCAP, cap)
+            name = lambda a, b: bytes(cap[a:b]).split(b"\0")[0].decode(errors="replace")
+            caps, dcaps = struct.unpack_from("II", cap, 84)
+            out.append((path, name(0, 16), name(16, 48), dcaps or caps))
+        except OSError: pass
+        finally: os.close(fd)
+    return out
+
+
+def find_camera(exclude=None):
+    """Index of the first real capture device, or None. Never a v4l2loopback node: after a reboot the loopback can be
+    /dev/video0, and reading it back would feed the filter its own output."""
+    for path, driver, card, caps in v4l2_devices():
+        if driver != "v4l2 loopback" and caps & 0x1 and path != exclude:   # V4L2_CAP_VIDEO_CAPTURE
+            return int(path.replace("/dev/video", ""))
+    return None
+
+
 class VirtualCam:
     """Frames out to a v4l2loopback device (load the module with exclusive_caps=1 so browsers see a camera), as
-    I420 (YU12), the format Zoom, Jitsi, Chrome and Firefox take from v4l2loopback. Plain ioctl + write, no packages."""
+    I420 (YU12), the format Zoom, Jitsi, Chrome and Firefox take from v4l2loopback. Plain ioctl + write, no packages.
+    Apps see the camera only while frames are being written. `watched()` reports whether an app is streaming from it
+    (v4l2loopback's client-usage event, checked on 0.15.4: 1 on a reader's STREAMON, 0 on its STREAMOFF or close)."""
     VIDIOC_QUERYCAP, VIDIOC_S_FMT = 0x80685600, 0xC0D05605          # x86_64 values (checked against linux/videodev2.h)
+    VIDIOC_SUBSCRIBE_EVENT, VIDIOC_DQEVENT = 0x4020565A, 0x80885659  # struct sizes 32 and 136 (checked with gcc)
+    EVENT_CLIENT_USAGE = 0x08000000 + 0x08E00000 + 1                # V4L2_EVENT_PRIVATE_START + v4l2loopback's offset + 1
     YU12, BUF_OUTPUT, FIELD_NONE, CS_SMPTE170M, CAP_OUTPUT = 0x32315559, 2, 1, 1, 0x2
+
+    @staticmethod
+    def find():
+        """The first v4l2loopback node, preferring one labelled "NPU"."""
+        loops = [(p, card) for p, driver, card, _ in v4l2_devices() if driver == "v4l2 loopback"]
+        if not loops:
+            sys.exit("no v4l2loopback device: sudo modprobe v4l2loopback video_nr=10 card_label=\"NPU Style\" exclusive_caps=1")
+        return next((p for p, card in loops if "NPU" in card), loops[0][0])
 
     def __init__(self, dev, w, h):
         import fcntl, struct
         assert w % 2 == 0 and h % 2 == 0
+        if dev == "auto": dev = self.find()
         self.w, self.h = w, h
         self.fd = os.open(dev, os.O_RDWR)
         cap = bytearray(104); fcntl.ioctl(self.fd, self.VIDIOC_QUERYCAP, cap)
@@ -1140,12 +1179,38 @@ class VirtualCam:
         gw, gh, gfmt = struct.unpack_from("III", fmt, 8)
         if (gw, gh, gfmt) != (w, h, self.YU12):
             sys.exit(f"{dev} took {gw}x{gh} fourcc {gfmt:#x} instead of {w}x{h} YU12")
-        self.name = f"{dev} ({driver})"
+        self.name = f"{dev} ({driver})"; self.dev = dev
+        self.usage = None                                         # None: the module has no client-usage event (assume watched)
+        try:
+            sub = bytearray(32); struct.pack_into("III", sub, 0, self.EVENT_CLIENT_USAGE, 0, 1)   # 1 = SEND_INITIAL
+            fcntl.ioctl(self.fd, self.VIDIOC_SUBSCRIBE_EVENT, sub); self.usage = 0
+        except OSError:
+            pass
 
-    def write(self, rgb):
+    def watched(self, timeout=0.0):
+        """True while an app streams from the device. Waits up to `timeout` seconds for a change."""
+        import fcntl, select, struct
+        if self.usage is None:                                    # cannot tell: wait as promised, say yes
+            if timeout: time.sleep(timeout)
+            return True
+        p = select.poll(); p.register(self.fd, select.POLLPRI); t = int(timeout * 1000)
+        while p.poll(t):
+            ev = bytearray(136)
+            try: fcntl.ioctl(self.fd, self.VIDIOC_DQEVENT, ev)
+            except OSError: break
+            if struct.unpack_from("I", ev, 0)[0] == self.EVENT_CLIENT_USAGE: self.usage = struct.unpack_from("I", ev, 8)[0]
+            t = 0
+        return self.usage > 0
+
+    def encode(self, rgb):
+        """RGB (any size) -> the device's I420 frame bytes."""
         import cv2
         if rgb.shape[:2] != (self.h, self.w): rgb = cv2.resize(rgb, (self.w, self.h), interpolation=cv2.INTER_LINEAR)
-        os.write(self.fd, cv2.cvtColor(np.ascontiguousarray(rgb), cv2.COLOR_RGB2YUV_I420).tobytes())
+        return cv2.cvtColor(np.ascontiguousarray(rgb), cv2.COLOR_RGB2YUV_I420).tobytes()
+
+    def write(self, frame):
+        """An RGB array, or bytes from encode() (a still frame converted once: no OpenCV work per write)."""
+        os.write(self.fd, frame if isinstance(frame, bytes) else self.encode(frame))
 
     def close(self):
         os.close(self.fd)
@@ -1196,10 +1261,11 @@ def main():
     ap.add_argument("--check", action="store_true", help="compare the last built phase with the emulator on the test image")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--image"); ap.add_argument("--out", default="style_out.png")
-    ap.add_argument("--window", action="store_true"); ap.add_argument("--camera", type=int, default=0)
+    ap.add_argument("--window", action="store_true")
+    ap.add_argument("--camera", type=int, help="camera index (default: the first capture device that is not a v4l2loopback)")
     ap.add_argument("--still", action="store_true", help="one webcam frame through every style -> style_still.png")
     ap.add_argument("--seconds", type=float, help="end the live loop after this many seconds (prints the frame rate)")
-    ap.add_argument("--vcam", help="also send the result to this v4l2loopback device (e.g. /dev/video10); without --window it runs headless")
+    ap.add_argument("--vcam", help="also send the result to this v4l2loopback device (e.g. /dev/video10, or auto); without --window it runs headless")
     ap.add_argument("--vcam-size", default="640x480", help="virtual camera resolution (the 320x240 result is scaled up)")
     ap.add_argument("--style", type=int, default=1, help="style to start with, 1-based")
     ap.add_argument("--cycle", type=float, help="switch to the next style every this many seconds")
@@ -1236,7 +1302,13 @@ def main():
             out = npu.run(rgb, style=i); name = a.out if len(npu.nets) == 1 else a.out.replace(".png", f"_{net.name}.png")
             cv2.imwrite(name, out[:, :, ::-1]); print(f"{net.name}: {npu.ms:.2f} ms -> {name}")
         return
-    cap = cv2.VideoCapture(a.camera); cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640); cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    vcam = None
+    if a.vcam:                                                    # before the camera: a missing loopback exits cleanly
+        vw, vh = map(int, a.vcam_size.lower().split("x")); vcam = VirtualCam(a.vcam, vw, vh)
+        print(f"virtual camera {vcam.name}: {vw}x{vh} I420" + ("" if a.window else "; headless, Ctrl-C stops"))
+    cam_index = find_camera(exclude=vcam.dev if vcam else None) if a.camera is None else a.camera
+    if cam_index is None: sys.exit("no camera")
+    cap = cv2.VideoCapture(cam_index, cv2.CAP_V4L2); cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640); cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     if not cap.isOpened(): sys.exit("no camera")
 
     def grab():
@@ -1259,10 +1331,6 @@ def main():
             f = grab()
             if f is not None: latest[0] = f
     reader_thread = threading.Thread(target=reader, daemon=True); reader_thread.start()
-    vcam = None
-    if a.vcam:
-        vw, vh = map(int, a.vcam_size.lower().split("x")); vcam = VirtualCam(a.vcam, vw, vh)
-        print(f"virtual camera {vcam.name}: {vw}x{vh} I420" + ("" if a.window else "; headless, Ctrl-C stops"))
     if a.window:
         import pygame
         pygame.init(); scale = 2 if W <= 480 else 1
