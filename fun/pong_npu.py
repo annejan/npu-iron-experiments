@@ -99,7 +99,7 @@ def policy(model, x, rng):
 class Learner:
     def __init__(self, lr=0.05, seed=3, selfplay=False, lr_half=LR_HALF):
         self.rng = np.random.default_rng(seed); self.game = Pong(self.rng); self.lr = lr; self.seed = seed; self.selfplay = selfplay
-        self.lr_half = lr_half
+        self.lr_half = lr_half; self.ebeta = 0.0
         self.trainer = M.TrainerNPU(NMB)
         self.model = M.Model.init(seed, ncls=NACT)
         ns = 2 * NG if selfplay else NG                                # self-play: both sides of every game learn
@@ -137,7 +137,7 @@ class Learner:
         adv = (R - R.mean()) / (R.std() + 1e-6)
         perm = self.rng.permutation(BATCH)
         lr = self.lr / (1 + self.updates / self.lr_half)
-        model, st = self.trainer.run(X, A.astype(np.uint8), perm, init=self.first, seed=self.seed, lr=lr, adv=adv, ncls=NACT)
+        model, st = self.trainer.run(X, A.astype(np.uint8), perm, init=self.first, seed=self.seed, lr=lr, adv=adv, ncls=NACT, ebeta=self.ebeta)
         if not st[2] and not self.first: sys.exit("the NPU lost its weights between calls")
         self.first = False; self.model = model; self.updates += 1; self.ms.append(self.trainer.ms)
 
@@ -155,8 +155,8 @@ class Learner:
         return float(np.mean(p)) if p else 0.0
 
 
-def train(n, lr, seed, selfplay=False, lr_half=LR_HALF):
-    L = Learner(lr, seed, selfplay, lr_half); t0 = time.perf_counter()
+def train(n, lr, seed, selfplay=False, lr_half=LR_HALF, ebeta=0.0):
+    L = Learner(lr, seed, selfplay, lr_half); L.ebeta = ebeta; t0 = time.perf_counter()
     for i in range(n):
         L.update()
         if (i + 1) % 20 == 0:
@@ -289,11 +289,12 @@ def main():
     ap.add_argument("--save", help="after --train, save the learned weights (npz)")
     ap.add_argument("--selfplay", action="store_true", help="train against itself (both paddles learn)")
     ap.add_argument("--lr-half", type=float, default=LR_HALF, help="learning rate lr / (1 + updates / this)")
+    ap.add_argument("--entropy", type=float, default=0.0, help="entropy bonus beta (computed on the NPU), against collapse")
     ap.add_argument("--play", help="play against saved weights (CPU only)")
     ap.add_argument("--selfplay-gif", nargs=2, metavar=("WEIGHTS", "GIF"), help="record the saved policy playing itself")
     a = ap.parse_args()
     if a.train:
-        L = train(a.train, a.lr, a.seed, a.selfplay, a.lr_half)
+        L = train(a.train, a.lr, a.seed, a.selfplay, a.lr_half, a.entropy)
         if a.save: save(L.model, a.save); print(f"saved {a.save}")
         if a.gif:
             w, l_ = record_gif(L, a.gif); print(f"wrote {a.gif}; while recording, all 64 games: {w} points won, {l_} lost")

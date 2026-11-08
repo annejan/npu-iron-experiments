@@ -586,8 +586,11 @@ it), and REINFORCE with this perceptron learns it slowly: 0.3 -> 0.5 returns per
 over 6000 updates (18 million moves, 5 minutes), after which the policy collapsed to a fixed action (0.1). Breakout
 (`fun/breakout_npu.py`, the same learner on a 28x28 Breakout) moved from 0.34 to about 0.65 bricks per lost ball in
 1000 updates. Without the shortcut the setup is sample-hungry and unstable; the learning-rate decay and the reward
-for returns that made the shortcut version stable do not prevent the collapse here. `--play w.npz` puts you on the
-left paddle against saved weights (CPU inference), which makes the shortcut obvious.
+for returns that made the shortcut version stable do not prevent the collapse here. An entropy bonus computed on the
+NPU does (`--entropy 0.01`; the gradient of the policy's entropy needs no logarithm, since `p_j (ln p_j + H)` equals
+`ln2 p_j (t_j - sum_k p_k t_k)` with `t` the `exp2` argument the softmax already has): over 6000 updates the policy
+dips and recovers instead of freezing, but it stays near 0.5 returns per point. `--play w.npz` puts you on the left
+paddle against saved weights (CPU inference), which makes the shortcut obvious.
 
 ## Room acoustics -> impulse response -> reverb (a chain)
 

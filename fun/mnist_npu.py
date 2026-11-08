@@ -70,9 +70,11 @@ def bf16(x):
     return (bf16_bits(x).astype(np.uint32) << 16).view(np.float32)
 
 
-def control(init, seed, lr, ncls=NOUT):
+def control(init, seed, lr, ncls=NOUT, ebeta=0.0):
     c = np.zeros(XOBJ // 4, np.int32)
     c[0] = MAGIC; c[1] = int(init); c[2] = seed; c[4] = ncls
+    c[5] = np.array([ebeta * np.log(2)], np.float32).view(np.int32)[0]          # the kernel uses beta ln2
+    c[6] = int(ebeta != 0)
     c[3] = bf16(np.array([-lr / B], np.float32)).view(np.int32)[0]
     return c.view(np.uint8)
 
@@ -88,7 +90,7 @@ def pixels_bf16(X):
     return _BF16_CACHE[key]
 
 
-def stream_into(buf, X, y, idx, init, seed, lr, adv=None, ncls=NOUT):
+def stream_into(buf, X, y, idx, init, seed, lr, adv=None, ncls=NOUT, ebeta=0.0):
     """Write one call's data into buf (uint8): control object, then per minibatch the labels and the images as bf16
     8x8 tiles [pb][bb][8 b][8 px] (the forward pass transposes them in the kernel), twice, for the forward and the
     backward pass (a shim BD cannot re-read with stride 0). Returns the minibatch count."""
@@ -101,7 +103,7 @@ def stream_into(buf, X, y, idx, init, seed, lr, adv=None, ncls=NOUT):
         np.copyto(v[:, r, 1:].view(np.uint64).reshape(nmb, NPB, NBB, 8, 2), src)
         v[:, r, 0, :B] = y[idx[:nmb * B]].reshape(nmb, B)
         v[:, r, 0, 256:256 + 4 * B] = w.reshape(nmb, B).view(np.uint8).reshape(nmb, 4 * B)
-    buf[:XOBJ] = control(init, seed, lr, ncls)
+    buf[:XOBJ] = control(init, seed, lr, ncls, ebeta)
     return nmb
 
 
@@ -208,6 +210,8 @@ alignas(64) static bf ONES[64];
 alignas(64) static int32_t lab[64];
 alignas(64) static float advw[64];                 // per-sample weight of the gradient (1 for supervised learning)
 static int ncls = 16;
+static float ebeta; static int eon;                  // entropy bonus (reinforcement learning), off for MNIST
+alignas(64) static float SH[16 * 16];                // per row o: t (the exp2 argument) of two batch blocks
 alignas(64) static int32_t stats[16];
 static int chunk, dumpi, cid_;
 static int32_t alive;
@@ -267,6 +271,7 @@ extern "C" void k_ctl(int8_t *x, int32_t cid) {
     const int32_t *c = (const int32_t *)x;
     cid_ = cid;
     ncls = c[4] > 0 ? c[4] : 16;
+    ebeta = *(const float *)(c + 5); eon = c[6];
     if (c[1]) {
         init_weights((uint32_t)c[2]); alive = 0x600D;
         for (int o = ncls; o < 16; o++) for (int b = 0; b < 8; b++) b2T[(o >> 3) * 64 + (o & 7) * 8 + b] = -1.0e4f;   // unused classes off
@@ -393,18 +398,31 @@ static void COLD softmax_pair(int pr, bf *gout) {
         aie::vector<bf, 16> zh = za.template to_vector<bf>(), zl = aie::sub(za, aie::accum<accfloat, 16>(zh)).template to_vector<bf>();
         aie::accum<accfloat, 16> t = aie::mul(zh, l2h); t = aie::mac(t, zl, l2h); t = aie::mac(t, zh, l2l);
         aie::vector<bf, 16> e = aie::exp2<bf>(t.template to_vector<float>());
-        aie::store_v(SE + 16 * o, e);
+        aie::store_v(SE + 16 * o, e); aie::store_v(SH + 16 * o, t.template to_vector<float>());
         s = aie::add(aie::accum<accfloat, 16>(s), aie::accum<accfloat, 16>(e).template to_vector<float>()).template to_vector<float>();
         ty = aie::select(ty, row, aie::eq(lb, aie::broadcast<int32, 16>(o)));
     }
     aie::vector<bf, 16> r = aie::inv(aie::accum<accfloat, 16>(s).template to_vector<bf>());
     aie::mask<16> ok = aie::ge(ty, m);
     stats[0] += ok.count();
+    // entropy bonus: with ln p = ln2 (t - log2 s), p_j (ln p_j + H) = ln2 p_j (t_j - sum_k p_k t_k): no logarithm needed
+    V16 tbar = aie::zeros<float, 16>();
+    if (eon)
+        for (int o = 0; o < 16; o++) {
+            aie::vector<bf, 16> p = aie::mul(aie::load_v<16>(SE + 16 * o), r).template to_vector<bf>();
+            tbar = aie::add(aie::accum<accfloat, 16>(tbar), aie::mul(p, aie::accum<accfloat, 16>(aie::load_v<16>(SH + 16 * o)).template to_vector<bf>()).template to_vector<float>()).template to_vector<float>();
+        }
+    const aie::vector<bf, 16> eb = aie::broadcast<bf, 16>((bf)ebeta);
     for (int o = 0; o < 16; o++) {
         V16 p = aie::mul(aie::load_v<16>(SE + 16 * o), r).template to_vector<float>();
         V16 oh = aie::select(aie::zeros<float, 16>(), aie::broadcast<float, 16>(1.0f), aie::eq(lb, aie::broadcast<int32, 16>(o)));
         aie::vector<bf, 16> d = aie::sub(aie::accum<accfloat, 16>(p), oh).template to_vector<bf>();
         d = aie::mul(d, av).template to_vector<bf>();                    // policy gradient: weighted by the advantage
+        if (eon) {                                               // + beta ln2 p (t - tbar): gradient of -beta H
+            aie::vector<bf, 16> q = aie::sub(aie::accum<accfloat, 16>(aie::load_v<16>(SH + 16 * o)), tbar).template to_vector<bf>();
+            aie::vector<bf, 16> pe = aie::mul(aie::mul(aie::accum<accfloat, 16>(p).template to_vector<bf>(), q).template to_vector<bf>(), eb).template to_vector<bf>();
+            d = aie::add(aie::accum<accfloat, 16>(d), pe).template to_vector<bf>();
+        }
         aie::vector<bf, 16> gv = aie::mul(d, cscale).template to_vector<bf>();
         const int h = o >> 3, oo = o & 7;
         for (int q = 0; q < 2; q++) {
@@ -602,9 +620,9 @@ class TrainerNPU:
         self.fn(self.src, self.dump, nmb=self.nmb, variant=self.variant)
         self.ms = (time.perf_counter() - t0) * 1e3
 
-    def prepare(self, X, y, idx, init=False, seed=1, lr=0.4, buf=0, adv=None, ncls=NOUT):
+    def prepare(self, X, y, idx, init=False, seed=1, lr=0.4, buf=0, adv=None, ncls=NOUT, ebeta=0.0):
         with self.srcs[buf].overwrite() as v:
-            nmb = stream_into(v.view(np.uint8), X, y, idx, init, seed, lr, adv, ncls)
+            nmb = stream_into(v.view(np.uint8), X, y, idx, init, seed, lr, adv, ncls, ebeta)
         assert nmb == self.nmb, (nmb, self.nmb)
 
     def call(self, buf=0):
@@ -614,8 +632,8 @@ class TrainerNPU:
         self.ms = (time.perf_counter() - t0) * 1e3
         return self.result()
 
-    def run(self, X, y, idx, init=False, seed=1, lr=0.4, adv=None, ncls=NOUT):
-        self.prepare(X, y, idx, init, seed, lr, adv=adv, ncls=ncls)
+    def run(self, X, y, idx, init=False, seed=1, lr=0.4, adv=None, ncls=NOUT, ebeta=0.0):
+        self.prepare(X, y, idx, init, seed, lr, adv=adv, ncls=ncls, ebeta=ebeta)
         return self.call()
 
     def result(self):
