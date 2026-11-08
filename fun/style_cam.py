@@ -6,6 +6,8 @@ fast_neural_style models, here the ONNX zoo exports) as a 31-phase int8 pipeline
   ./env.sh python fun/style_cam.py --image in.jpg --out x.png  one picture, every style
   ./env.sh python fun/style_cam.py --window                    live webcam (keys 1..5 pick the style, 0 input, ESC)
   ./env.sh python fun/style_cam.py --bench                     NPU time per frame
+  ./env.sh python fun/style_cam.py --vcam /dev/video10         virtual webcam for Zoom/Jitsi/the browser (v4l2loopback),
+                                                               headless; add --window to watch, --cycle 20 to rotate styles
 
 The network: conv9x9 3->32, two stride-2 conv3x3 (->64, ->128), five residual blocks at 128 channels, two nearest-upsample
 conv3x3 (->64, ->32), conv9x9 32->3; reflection padding; InstanceNorm (affine) + ReLU after every conv but the last.
@@ -1113,6 +1115,42 @@ class StyleNPU:
         return out, st
 
 
+# ------------------------------------------------------------------------------------------------- virtual webcam
+class VirtualCam:
+    """Frames out to a v4l2loopback device (load the module with exclusive_caps=1 so browsers see a camera), as
+    I420 (YU12), the format Zoom, Jitsi, Chrome and Firefox take from v4l2loopback. Plain ioctl + write, no packages."""
+    VIDIOC_QUERYCAP, VIDIOC_S_FMT = 0x80685600, 0xC0D05605          # x86_64 values (checked against linux/videodev2.h)
+    YU12, BUF_OUTPUT, FIELD_NONE, CS_SMPTE170M, CAP_OUTPUT = 0x32315559, 2, 1, 1, 0x2
+
+    def __init__(self, dev, w, h):
+        import fcntl, struct
+        assert w % 2 == 0 and h % 2 == 0
+        self.w, self.h = w, h
+        self.fd = os.open(dev, os.O_RDWR)
+        cap = bytearray(104); fcntl.ioctl(self.fd, self.VIDIOC_QUERYCAP, cap)
+        driver = bytes(cap[:16]).split(b"\0")[0].decode(errors="replace")
+        caps, dcaps = struct.unpack_from("II", cap, 84)
+        if not ((dcaps or caps) & self.CAP_OUTPUT):
+            os.close(self.fd)
+            sys.exit(f"{dev} ({driver}) is not an output device: point --vcam at the v4l2loopback node, not the camera")
+        fmt = bytearray(208)
+        struct.pack_into("I", fmt, 0, self.BUF_OUTPUT)
+        struct.pack_into("12I", fmt, 8, w, h, self.YU12, self.FIELD_NONE, w, w * h * 3 // 2, self.CS_SMPTE170M, 0, 0, 0, 0, 0)
+        fcntl.ioctl(self.fd, self.VIDIOC_S_FMT, fmt)
+        gw, gh, gfmt = struct.unpack_from("III", fmt, 8)
+        if (gw, gh, gfmt) != (w, h, self.YU12):
+            sys.exit(f"{dev} took {gw}x{gh} fourcc {gfmt:#x} instead of {w}x{h} YU12")
+        self.name = f"{dev} ({driver})"
+
+    def write(self, rgb):
+        import cv2
+        if rgb.shape[:2] != (self.h, self.w): rgb = cv2.resize(rgb, (self.w, self.h), interpolation=cv2.INTER_LINEAR)
+        os.write(self.fd, cv2.cvtColor(np.ascontiguousarray(rgb), cv2.COLOR_RGB2YUV_I420).tobytes())
+
+    def close(self):
+        os.close(self.fd)
+
+
 # ------------------------------------------------------------------------------------------------- checks and CLI
 def check(npu, img):
     """Compare the NPU's last computed phase with the emulator."""
@@ -1160,14 +1198,18 @@ def main():
     ap.add_argument("--image"); ap.add_argument("--out", default="style_out.png")
     ap.add_argument("--window", action="store_true"); ap.add_argument("--camera", type=int, default=0)
     ap.add_argument("--still", action="store_true", help="one webcam frame through every style -> style_still.png")
-    ap.add_argument("--seconds", type=float, help="end the live window after this many seconds (prints the frame rate)")
+    ap.add_argument("--seconds", type=float, help="end the live loop after this many seconds (prints the frame rate)")
+    ap.add_argument("--vcam", help="also send the result to this v4l2loopback device (e.g. /dev/video10); without --window it runs headless")
+    ap.add_argument("--vcam-size", default="640x480", help="virtual camera resolution (the 320x240 result is scaled up)")
+    ap.add_argument("--style", type=int, default=1, help="style to start with, 1-based")
+    ap.add_argument("--cycle", type=float, help="switch to the next style every this many seconds")
     ap.add_argument("--bench", action="store_true")
     ap.add_argument("--test-image", default=str(Path.home() / "models/yolo26n/coco128/images/train2017/000000000030.jpg"))
     a = ap.parse_args()
     import cv2
     W, H = map(int, a.size.lower().split("x"))
     models = a.model or [str(MODELS / f"{n}-9.onnx") for n in ("mosaic", "candy", "rain-princess", "udnie", "pointilism")]
-    if not (a.check or a.selftest or a.bench or a.image or a.window or a.still):
+    if not (a.check or a.selftest or a.bench or a.image or a.window or a.still or a.vcam):
         ap.print_help(); return
     npu = StyleNPU(models[:1] if a.check else models, W, H, nphases=a.phases)
     img = cv2.resize(cv2.imread(a.test_image), (W, H))[:, :, ::-1].copy()
@@ -1209,7 +1251,7 @@ def main():
         while len(tiles) % 3: tiles.append(np.zeros_like(rgb))
         grid = np.concatenate([np.concatenate(tiles[i:i + 3], 1) for i in range(0, len(tiles), 3)], 0)
         cv2.imwrite("style_still.png", grid[:, :, ::-1]); print(f"wrote style_still.png ({npu.ms:.1f} ms per frame on the NPU)"); return
-    import pygame, threading
+    import threading
     latest = [None]; stop = [False]
 
     def reader():                                                 # the camera paces itself; keep only the newest frame
@@ -1217,24 +1259,43 @@ def main():
             f = grab()
             if f is not None: latest[0] = f
     threading.Thread(target=reader, daemon=True).start()
-    pygame.init(); scale = 2 if W <= 480 else 1
-    screen = pygame.display.set_mode((W * scale, H * scale)); font = pygame.font.SysFont(None, 24)
-    n, t0, style, show_in = 0, time.perf_counter(), 0, False
-    while True:
-        for e in pygame.event.get():
-            if e.type == pygame.QUIT or (e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE): stop[0] = True; return
-            if e.type == pygame.KEYDOWN and pygame.K_1 <= e.key <= pygame.K_9 and e.key - pygame.K_1 < len(npu.nets): style = e.key - pygame.K_1
-            if e.type == pygame.KEYDOWN and e.key == pygame.K_0: show_in = not show_in
-        rgb, latest[0] = latest[0], None
-        if rgb is None: time.sleep(0.002); continue
-        out = rgb if show_in else npu.run(rgb, style=style); n += 1
-        if a.seconds and time.perf_counter() - t0 > a.seconds:
-            stop[0] = True
-            print(f"{n} frames in {time.perf_counter() - t0:.1f} s = {n / (time.perf_counter() - t0):.1f} fps (camera-bound); NPU {npu.ms:.2f} ms per frame"); return
-        frame = cv2.resize(out, (W * scale, H * scale), interpolation=cv2.INTER_LINEAR) if scale != 1 else out
-        screen.blit(pygame.surfarray.make_surface(np.transpose(frame, (1, 0, 2))), (0, 0))
-        screen.blit(font.render(f"{npu.nets[style].name} on the NPU: {npu.ms:.1f} ms  {n / (time.perf_counter() - t0):.1f} fps  (1-{len(npu.nets)} style, 0 input, ESC)", True, (255, 255, 0)), (8, 8))
-        pygame.display.flip()
+    vcam = None
+    if a.vcam:
+        vw, vh = map(int, a.vcam_size.lower().split("x")); vcam = VirtualCam(a.vcam, vw, vh)
+        print(f"virtual camera {vcam.name}: {vw}x{vh} I420" + ("" if a.window else "; headless, Ctrl-C stops"))
+    if a.window:
+        import pygame
+        pygame.init(); scale = 2 if W <= 480 else 1
+        screen = pygame.display.set_mode((W * scale, H * scale)); font = pygame.font.SysFont(None, 24)
+    n, t0, show_in = 0, time.perf_counter(), False
+    style = max(0, min(len(npu.nets) - 1, a.style - 1)); t_style = t0; t_print = t0
+    try:
+        while True:
+            if a.window:
+                for e in pygame.event.get():
+                    if e.type == pygame.QUIT or (e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE): return
+                    if e.type == pygame.KEYDOWN and pygame.K_1 <= e.key <= pygame.K_9 and e.key - pygame.K_1 < len(npu.nets): style = e.key - pygame.K_1
+                    if e.type == pygame.KEYDOWN and e.key == pygame.K_0: show_in = not show_in
+            now = time.perf_counter()
+            if a.cycle and now - t_style > a.cycle: style = (style + 1) % len(npu.nets); t_style = now
+            rgb, latest[0] = latest[0], None
+            if rgb is None: time.sleep(0.002); continue
+            out = rgb if show_in else npu.run(rgb, style=style); n += 1
+            if vcam: vcam.write(out)
+            if a.seconds and now - t0 > a.seconds:
+                print(f"{n} frames in {now - t0:.1f} s = {n / (now - t0):.1f} fps (camera-bound); NPU {npu.ms:.2f} ms per frame"); return
+            if not a.window:
+                if now - t_print > 5: print(f"{npu.nets[style].name}: {n / (now - t0):.1f} fps, NPU {npu.ms:.1f} ms per frame"); t_print = now
+                continue
+            frame = cv2.resize(out, (W * scale, H * scale), interpolation=cv2.INTER_LINEAR) if scale != 1 else out
+            screen.blit(pygame.surfarray.make_surface(np.transpose(frame, (1, 0, 2))), (0, 0))
+            screen.blit(font.render(f"{npu.nets[style].name} on the NPU: {npu.ms:.1f} ms  {n / (time.perf_counter() - t0):.1f} fps  (1-{len(npu.nets)} style, 0 input, ESC)", True, (255, 255, 0)), (8, 8))
+            pygame.display.flip()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop[0] = True
+        if vcam: vcam.close()
 
 
 if __name__ == "__main__":

@@ -171,7 +171,7 @@ Batch work per dispatch; keep one call per frame.
 | `patterns.py` | RLE helper with the classic Life objects for `life_window.py` (no main) |
 | `dx7.py` | DX7-style FM synth: 512 six-operator voices, voices in the lanes, sine through the lookup unit, the 32 algorithms as data; `--window` plays it from the keyboard, bit-exact numpy replica, `dx7_demo.wav` |
 | `nam_amp.py` | Neural Amp Modeler guitar amps (`.nam` WaveNet captures) as a 16-core pipeline per amp, two amps at once; `--wav` renders a DI through amp and cab IR, `--live` is mic/line in to speakers at 1.3 ms blocks, `--selftest` / `--stages` compare with a float32 reference per core; see the section |
-| `style_cam.py` | fast neural style transfer (the five pytorch/examples styles from the ONNX zoo) as an int8 31-phase pipeline in one dispatch; `--window` live webcam (keys 1-5 pick the style, 0 shows the input), `--image` restyles a picture, `--selftest` checks every style against the int8 emulation, float32 and onnxruntime, `--phases N --check` one phase at a time; see the section |
+| `style_cam.py` | fast neural style transfer (the five pytorch/examples styles from the ONNX zoo) as an int8 31-phase pipeline in one dispatch; `--window` live webcam (keys 1-5 pick the style, 0 shows the input), `--vcam /dev/video10` feeds a v4l2loopback virtual camera for video calls (load the module with `exclusive_caps=1`; `--cycle 20` rotates the styles), `--image` restyles a picture, `--selftest` checks every style against the int8 emulation, float32 and onnxruntime, `--phases N --check` one phase at a time; see the section |
 | `probe/plasma.py` | 3-sine plasma, `--window` |
 | `physarum_route.py` | slime-mould router for KiCad boards (Tero's Physarum solver, every net a tube network competing for space); `--window` / `--video` show the tubes grow, `--write-pcb` writes the tubes as tracks and vias into a copy of the board (opens in KiCad), `--write-pro` writes topor priority net classes. CPU only (sparse direct solves), see the section |
 
@@ -485,6 +485,15 @@ bit-exact when the emulator is fed the NPU's own input tensor; what grows throug
 float32 model (mosaic, whose glass pattern is chaotic, 27 dB on the test picture; udnie 44.5 dB); that last
 number is the int8 design itself, a 16-bit raw shift or other headrooms change it by 0.3 dB. The float32 numpy
 reference is 86-93 dB from onnxruntime.
+
+As a virtual webcam: `--vcam` writes the result, scaled to 640x480, as I420 frames to a v4l2loopback device (a
+plain `VIDIOC_S_FMT` ioctl and `write()`, no packages), so Zoom, Jitsi or a browser can pick "NPU Style" as camera:
+
+```
+sudo zypper in v4l2loopback-kmp-default      # openSUSE; other distros: v4l2loopback-dkms
+sudo modprobe v4l2loopback video_nr=10 card_label="NPU Style" exclusive_caps=1
+./env.sh python fun/style_cam.py --vcam /dev/video10 --window
+```
 
 Costs that are left: 123 MB in and 65 MB out of DDR per frame (a 5632-byte object for every row window, which
 wastes most of it for the 8-channel input of conv1 and the 32-channel layers), 1632 DMA transfers. Live, the
