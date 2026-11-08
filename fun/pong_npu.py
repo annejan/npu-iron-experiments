@@ -3,6 +3,8 @@
 
   ./env.sh python fun/pong_npu.py --train 300           300 updates, prints the share of points won
   ./env.sh python fun/pong_npu.py --window              watch four of the 64 games while it learns
+  ./env.sh python fun/pong_npu.py --train 1000 --save pong.npz --gif pong.gif   keep the learned weights
+  ./env.sh python fun/pong_npu.py --play pong.npz        you (left paddle, up/down or W/S) against what it learned
 
 The player is the right paddle; the left one is a script that follows the ball a little too slowly. The network is
 mnist_npu.py's 784-256-16 perceptron with three live outputs (up, stay, down); its input is the 28x28 screen with the
@@ -133,6 +135,82 @@ def train(n, lr, seed):
     return L
 
 
+def record_gif(L, path, steps=160, games=(0, 1, 2, 3), scale=8):
+    """Four of the games played by the current policy, drawn at 8x with a ball trail, as an animated GIF."""
+    from PIL import Image, ImageDraw, ImageFont
+    S = SZ * scale; pad = 6; head = 44
+    font = ImageFont.load_default(size=18); bigf = ImageFont.load_default(size=22)
+    trails = {g: [] for g in games}; score = {g: [0, 0] for g in games}; frames = []
+    won_total = [0, 0]
+    for step in range(steps):
+        x = L.game.frame(); a, _ = policy(L.model, x, L.rng)
+        for g in games: trails[g] = (trails[g] + [(L.game.bx[g], L.game.by[g])])[-7:]
+        r, hit = L.game.step(a)
+        for g in games:
+            if r[g] > 0: score[g][0] += 1
+            if r[g] < 0: score[g][1] += 1
+            if r[g]: trails[g] = []
+        won_total[0] += int((r > 0).sum()); won_total[1] += int((r < 0).sum())
+        im = Image.new("RGB", (2 * S + 3 * pad, 2 * S + 3 * pad + head), (10, 10, 16)); d = ImageDraw.Draw(im)
+        d.text((pad, 12), f"NPU (orange) after {L.updates} updates", fill=(235, 235, 235), font=bigf)
+        for k, g in enumerate(games):
+            ox, oy = pad + (k % 2) * (S + pad), head + pad + (k // 2) * (S + pad)
+            d.rectangle([ox, oy, ox + S - 1, oy + S - 1], fill=(18, 20, 34))
+            for yy in range(0, S, 2 * scale): d.rectangle([ox + S // 2 - 1, oy + yy, ox + S // 2, oy + yy + scale - 1], fill=(40, 44, 66))
+            for t, (bx, by) in enumerate(trails[g]):
+                rad = scale * (0.25 + 0.06 * t); c = int(40 + 25 * t)
+                d.ellipse([ox + (bx + 0.5) * scale - rad, oy + (by + 0.5) * scale - rad, ox + (bx + 0.5) * scale + rad, oy + (by + 0.5) * scale + rad], fill=(c, c, c + 20))
+            for px, py, col in ((SZ - 2, L.game.py[g], (255, 150, 40)), (1, L.game.oy[g], (70, 150, 255))):
+                x0 = ox + px * scale; y0 = oy + (py - PADH / 2 + 0.5) * scale
+                d.rounded_rectangle([x0 - 2, y0 - 2, x0 + scale + 1, y0 + PADH * scale + 1], radius=4, fill=tuple(v // 3 for v in col))
+                d.rounded_rectangle([x0, y0, x0 + scale - 1, y0 + PADH * scale - 1], radius=3, fill=col)
+            bx, by = L.game.bx[g], L.game.by[g]
+            d.ellipse([ox + bx * scale + 1, oy + by * scale + 1, ox + (bx + 1) * scale - 1, oy + (by + 1) * scale - 1], fill=(250, 250, 250))
+            d.text((ox + S // 2 - 40, oy + 6), f"{score[g][1]}", fill=(70, 150, 255), font=font)
+            d.text((ox + S // 2 + 28, oy + 6), f"{score[g][0]}", fill=(255, 150, 40), font=font)
+        frames.append(im.quantize(colors=48, method=Image.Quantize.MEDIANCUT))
+    frames[0].save(path, save_all=True, append_images=frames[1:], duration=45, loop=0, optimize=True)
+    return won_total
+
+
+def save(model, path):
+    np.savez(path, W1=model.W1, b1=model.b1, W2=model.W2, b2=model.b2)
+
+
+def load(path):
+    d = np.load(path); return M.Model(d["W1"], d["b1"], d["W2"], d["b2"])
+
+
+def play(path, seconds=None):
+    """You against the learned policy, one big game; the policy runs on the CPU with the weights the NPU learned."""
+    import pygame
+    model = load(path); rng = np.random.default_rng()
+    g = Pong(rng, opp_speed=0.0); scale = 22; S = SZ * scale
+    pygame.init(); screen = pygame.display.set_mode((S, S + 50)); pygame.display.set_caption("You vs the NPU's Pong")
+    font = pygame.font.SysFont(None, 40); clock = pygame.time.Clock(); score = [0, 0]; t0 = time.perf_counter(); trail = []
+    while True:
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT or (e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE): return
+        k = pygame.key.get_pressed()
+        move = (1.0 if (k[pygame.K_DOWN] or k[pygame.K_s]) else 0.0) - (1.0 if (k[pygame.K_UP] or k[pygame.K_w]) else 0.0)
+        a, _ = policy(model, g.frame(), rng)
+        trail = (trail + [(g.bx[0], g.by[0])])[-8:]
+        g.oy = np.clip(g.oy + move * 1.0, PADH // 2, SZ - 1 - PADH // 2) - np.clip(g.by - g.oy, -0.0, 0.0)
+        r, _ = g.step(a)
+        if r[0] > 0: score[0] += 1; trail = []                          # the NPU won the point
+        if r[0] < 0: score[1] += 1; trail = []
+        screen.fill((10, 10, 16)); pygame.draw.rect(screen, (18, 20, 34), (0, 50, S, S))
+        for yy in range(0, S, 2 * scale): pygame.draw.rect(screen, (40, 44, 66), (S // 2 - 2, 50 + yy, 4, scale))
+        for t, (bx, by) in enumerate(trail):
+            c = 40 + 22 * t; pygame.draw.circle(screen, (c, c, c + 20), (int((bx + 0.5) * scale), int(50 + (by + 0.5) * scale)), int(scale * (0.2 + 0.04 * t)))
+        for px, py, col in ((SZ - 2, g.py[0], (255, 150, 40)), (1, g.oy[0], (70, 150, 255))):
+            pygame.draw.rect(screen, col, (px * scale, 50 + (py - PADH / 2 + 0.5) * scale, scale, PADH * scale), border_radius=6)
+        pygame.draw.circle(screen, (250, 250, 250), (int((g.bx[0] + 0.5) * scale), int(50 + (g.by[0] + 0.5) * scale)), scale // 2)
+        screen.blit(font.render(f"you {score[1]}   NPU {score[0]}", True, (235, 235, 235)), (16, 12))
+        pygame.display.flip(); clock.tick(30)
+        if seconds and time.perf_counter() - t0 > seconds: return
+
+
 def window(lr, seed, seconds=None, shot=None):
     import pygame
     L = Learner(lr, seed); pygame.init(); W, H = 1100, 620
@@ -173,10 +251,18 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--train", type=int, default=0); ap.add_argument("--lr", type=float, default=0.05); ap.add_argument("--seed", type=int, default=3)
     ap.add_argument("--window", action="store_true"); ap.add_argument("--seconds", type=float); ap.add_argument("--shot")
+    ap.add_argument("--gif", help="after --train, record four games of the trained policy to this GIF")
+    ap.add_argument("--save", help="after --train, save the learned weights (npz)")
+    ap.add_argument("--play", help="play against saved weights (CPU only)")
     a = ap.parse_args()
-    if a.train: train(a.train, a.lr, a.seed)
+    if a.train:
+        L = train(a.train, a.lr, a.seed)
+        if a.save: save(L.model, a.save); print(f"saved {a.save}")
+        if a.gif:
+            w, l_ = record_gif(L, a.gif); print(f"wrote {a.gif}; while recording, all 64 games: {w} points won, {l_} lost")
     if a.window: window(a.lr, a.seed, a.seconds, a.shot)
-    if not (a.train or a.window): ap.print_help()
+    if a.play: play(a.play, a.seconds)
+    if not (a.train or a.window or a.play): ap.print_help()
 
 
 if __name__ == "__main__":

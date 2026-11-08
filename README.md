@@ -77,6 +77,7 @@ soundfile and sounddevice, the live ones headphones.
 | ![Sandpile](docs/img/sandpile.png) Abelian sandpile, 2^18 grains | ![Gray-Scott](docs/img/grayscott.png) Gray-Scott coral | ![YOLO](docs/img/yolo_coco.png) YOLO26n, 150 fps, real weights |
 | ![Cyclic](docs/img/spiral_cyclic.png) Cyclic CA demons | ![GH](docs/img/spiral_gh.png) Greenberg-Hastings spirals | ![Plasma](docs/img/plasma.png) 1080p plasma, 0.34 ms/frame |
 | ![Room](docs/img/room.png) Corridor impulse response, 3-D FDTD | ![Style](docs/img/style_coco.png) Neural style transfer, 5 styles, 16.7 ms/frame | ![MNIST](docs/img/mnist_npu.png) The NPU learns MNIST, 50 ms/epoch |
+| ![Pong](docs/img/pong_npu.gif) The NPU learns Pong from pixels | | |
 
 (The YOLO and style pictures are COCO 2017 image 30: photo by julie, https://www.flickr.com/photos/roosterfarm/3573516590, CC BY 2.0, boxes added / restyled by the NPU.)
 
@@ -124,6 +125,7 @@ stated, min or median after a warm-up call, host wall clock from Python unless t
 | NAM guitar amp (WaveNet, 13320 MAC/sample), 64-sample blocks, 16 cores per amp | 0.54 ms per block (1.33 ms of audio) for two amps at once, 65.9 dB SNR vs the float32 model with bf16 hi+lo pairs, 48 dB with single bf16 weights; live at 1.3 ms blocks, no underruns (`fun/nam_amp.py`) |
 | Fast neural style transfer (Johnson TransformerNet, 1.68 M params, 13.8 GMAC per 320x240 frame), int8, 31 phases on 32 cores in one dispatch | **16.7 ms per frame on the NPU**, 18.6 ms (54 fps) for the whole Python call with upload and readback; 45-52 dB PSNR from a numpy emulation of the int8 design, which is 27-45 dB from the float32 model depending on the style (`fun/style_cam.py`) |
 | MNIST training (784-256-10 MLP, bf16 matmuls, fp32 master weights resident in L1, model parallel over 32 cores), 937 minibatches of 64 per dispatch | **49.5 ms per epoch** on the NPU back to back (84 ms when the 200 MB stream was just rewritten; numpy fp32 on the CPU: 280 ms), 96.4% test accuracy after one epoch, 97.9% after five (numpy, same setup: 96.7 / 97.9); initialisation bit-exact, one SGD step within about 1% of a bf16 numpy replica (`fun/mnist_npu.py`) |
+| Pong from pixels, REINFORCE with the MNIST trainer (28x28 input, 3 actions), 3008 moves per update | 5-6 ms of NPU time per update; from 10% of points won (random) to 54-59% after 1000 updates (10 min, the CPU's 64 games set the pace) against a slightly slow scripted opponent (`fun/pong_npu.py`) |
 | Additive synth, 3072 partials, 1024-sample blocks | 0.38 ms per block (21 ms of audio: 56x real time for all 3072 partials) = 8 G partial-samples/s, amplitude drift-free, 0.03 Hz tuning (`fun/additive.py`) |
 | Binaural, 32 sources x 2 ears x 160 taps, 1024-sample blocks | 0.28 ms per block (dispatch-bound), bit-exact, 38x real time (`fun/binaural.py`) |
 | conv2d engine 512x512: K=3 / 7 / 15 | 0.27 / 0.35 / 0.91 ms per pass, 1-4 LSB vs numpy (`fun/conv2d.py`) |
@@ -174,6 +176,7 @@ Batch work per dispatch; keep one call per frame.
 | `nam_amp.py` | Neural Amp Modeler guitar amps (`.nam` WaveNet captures) as a 16-core pipeline per amp, two amps at once; `--wav` renders a DI through amp and cab IR, `--live` is mic/line in to speakers at 1.3 ms blocks, `--selftest` / `--stages` compare with a float32 reference per core; see the section |
 | `style_cam.py` | fast neural style transfer (the five pytorch/examples styles from the ONNX zoo) as an int8 31-phase pipeline in one dispatch; `--window` live webcam (keys 1-5 pick the style, 0 shows the input), `--vcam /dev/video10` feeds a v4l2loopback virtual camera for video calls (load the module with `exclusive_caps=1`; `--cycle 20` rotates the styles), `--image` restyles a picture, `--selftest` checks every style against the int8 emulation, float32 and onnxruntime, `--phases N --check` one phase at a time; see the section |
 | `mnist_npu.py` | the NPU trains a neural network: MNIST, forward and backward pass and SGD update on all 32 cores, weights never leave the chip; `--epochs N`, `--selftest`, `--bench`, `--window` shows the first-layer weights forming and the accuracy climbing, classifies what you draw with the live weights, and learns new symbols you draw (keys A-F); see the section |
+| `pong_npu.py` | the same trainer learns Pong from pixels (REINFORCE): 64 games on the CPU, policy updates on the NPU; `--train N --gif x.gif --save w.npz`, `--window` to watch it learn, `--play w.npz` to play against what it learned |
 | `probe/plasma.py` | 3-sine plasma, `--window` |
 | `physarum_route.py` | slime-mould router for KiCad boards (Tero's Physarum solver, every net a tube network competing for space); `--window` / `--video` show the tubes grow, `--write-pcb` writes the tubes as tracks and vias into a copy of the board (opens in KiCad), `--write-pro` writes topor priority net classes. CPU only (sparse direct solves), see the section |
 
@@ -557,6 +560,27 @@ same streams and synchronisation take 11 ms per epoch, so the rest is the chain 
 and the matmuls. A shim BD cannot read the same minibatch twice by itself (a stride of 0 does not encode), so the
 host writes it twice.
 
+## The NPU learns to play Pong
+
+![pong](docs/img/pong_npu.gif)
+
+`fun/pong_npu.py` reuses the MNIST trainer for reinforcement learning, after Karpathy's "Pong from Pixels": the
+policy is the same 784-256 perceptron with three live outputs (up, stay, down), its input the 28x28 screen with the
+previous frame's ball and paddles at half brightness (so the ball's direction is visible). 64 games run in numpy on
+the CPU, actions are sampled on the CPU with the weights of the latest update, and every 3008 moves whose outcome is
+known go to the NPU as one call of 47 minibatches. The kernel needed one addition: a per-sample weight carried next
+to the labels, so the last core forms `G = -lr/B * advantage * (p - onehot(action))`, the REINFORCE gradient (the
+advantage is the reward of the move's point, discounted back and standardised per batch). For MNIST the weight is 1
+and the result is bit-identical; a class count in the control object switches the other 13 outputs off.
+
+It learns: from 10% of points won (random play) to 54-59% after 1000 updates in 10 minutes, the right paddle
+tracking the ball and returning it 3-4 times per point, against a scripted left paddle that follows the ball a
+little too slowly. The NPU takes 5-6 ms per update; the rest is the CPU playing the games. Two things were needed to
+keep it from falling apart: with a learning rate of 0.05 the policy reached 39% and collapsed to a near-deterministic
+one at 12%; at 0.02 it climbed to 55% and collapsed later. Counting every return of the ball as a small reward of
+its own (credit far more frequent than points) and a decaying learning rate made it climb steadily. `--play`
+lets you take the left paddle against saved weights.
+
 ## Room acoustics -> impulse response -> reverb (a chain)
 
 `fun/room.py` simulates a 2.7 x 2.7 x 11 m hard-walled corridor with the 3-D wave equation (7-point
@@ -783,6 +807,8 @@ pad-to-pad distance and how much competition it meets along the way, binned into
   K. D. Martin, "HRTF Measurements of a KEMAR Dummy-Head Microphone", MIT Media Lab Perceptual
   Computing TR 280 (https://sound.media.mit.edu/resources/KEMAR.html); downloaded on first run,
   not redistributed.
+* Pong from pixels follows Andrej Karpathy's blog post "Deep Reinforcement Learning: Pong from Pixels" (2016), REINFORCE
+  is Williams (1992); the game and the code here are written from scratch.
 * Algorithms are cited in each script's docstring: Lenia (Chan 2019), Physarum agents (Jones 2010), the
   Physarum solver (Tero, Kobayashi, Nakagaki 2007; Tero et al. 2010),
   the Gordon-Smith "magic circle" oscillator, Visscher's scheme, Gray-Scott/Pearson, Onsager and
