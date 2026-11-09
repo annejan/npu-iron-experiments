@@ -10,7 +10,7 @@ card so apps keep listing the camera. v4l2loopback tells the writer when a reade
                                             in ironenv through ./env.sh)
   python3 fun/style_tray.py --vcam /dev/video10 --camera 0
 
-Menu: the five styles or the plain camera, cycle the styles, "Only while an app uses the camera" (off = always live),
+Menu: the five styles (plus any in ~/models/style/*/*-9.onnx, see style_train.py) or the plain camera, cycle the styles, "Only while an app uses the camera" (off = always live),
 preview window, stop/start, quit. Left click on the icon toggles the preview, middle click picks the next style. The
 icon shows the live picture. The choices are remembered (QSettings).
 
@@ -28,11 +28,18 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
-STYLES = ("mosaic", "candy", "rain-princess", "udnie", "pointilism")          # style_cam.py's order: --style 1..5
-TITLES = ("Plain camera", "Mosaic", "Candy", "Rain princess", "Udnie", "Pointillism")   # index 0 = no filter
+NAMES = {"mosaic": "Mosaic", "candy": "Candy", "rain-princess": "Rain princess", "udnie": "Udnie", "pointilism": "Pointillism"}
 W, H = 320, 240
 HDR = 16                                                                       # shared frame: u64 seq, u32 w, u32 h
 CYCLE_S = 20
+
+
+
+
+def title(path):
+    """Menu name of a style file: the zoo names as they are spelled, others from the file name (starry-night-9.onnx)."""
+    n = Path(path).stem.removesuffix("-9")
+    return NAMES.get(n, n.replace("-", " ").replace("_", " ").capitalize())
 
 
 # --------------------------------------------------------------------------------------------- child (ironenv side)
@@ -133,7 +140,8 @@ def child(a):
 
     st = {"style": a.style, "cycle": a.cycle, "auto": a.auto, "preview": False}
     say(t="starting")
-    npu = SC.StyleNPU([str(SC.MODELS / f"{n}-9.onnx") for n in STYLES], W, H, verbose=False)
+    npu = SC.StyleNPU(a.model or SC.style_models(), W, H, verbose=False)
+    st["style"] = min(max(st["style"], 0), len(npu.nets))
     if stop.is_set(): say(t="bye"); return                       # quit arrived while the NPU part was built
     vw, vh = map(int, a.vcam_size.lower().split("x"))
     vcam = SC.VirtualCam(a.vcam, vw, vh)
@@ -186,7 +194,7 @@ def child(a):
                 continue
             cam_err = None
             if st["cycle"] and st["style"] > 0 and now - t_style > st["cycle"]:
-                st["style"] = st["style"] % len(STYLES) + 1; t_style = now; say(t="style", style=st["style"])
+                st["style"] = st["style"] % len(npu.nets) + 1; t_style = now; say(t="style", style=st["style"])
             out = rgb if st["style"] == 0 else npu.run(rgb, style=st["style"] - 1)
             vcam.write(out)
             if shm: shm.put(out)
@@ -245,7 +253,9 @@ def tray(a):
     class Tray:
         def __init__(self):
             self.cfg = QSettings("npu-iron-experiments", "style-tray")
-            self.style = int(self.cfg.value("style", 1))
+            sys.path.insert(0, str(HERE)); from style_cam import style_models
+            self.models = style_models(); self.titles = ["Plain camera"] + [title(p) for p in self.models]   # 0 = no filter
+            self.style = min(max(int(self.cfg.value("style", 1)), 0), len(self.models))
             self.auto = self.cfg.value("auto", True, type=bool)
             self.cycle = self.cfg.value("cycle", False, type=bool)
             self.shm = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / f"npu-style-{os.getpid()}.rgb"
@@ -263,7 +273,7 @@ def tray(a):
             m = self.menu = QMenu()
             self.a_status = m.addAction("starting ..."); self.a_status.setEnabled(False); m.addSeparator()
             grp = QActionGroup(m); grp.setExclusive(True); self.a_style = []
-            for i, t in enumerate(TITLES):
+            for i, t in enumerate(self.titles):
                 act = QAction(t if i == 0 else f"{i}  {t}", m, checkable=True); act.setChecked(i == self.style)
                 act.triggered.connect(lambda _=False, i=i: self.set_style(i)); grp.addAction(act); m.addAction(act); self.a_style.append(act)
                 if i == 0: m.addSeparator()
@@ -286,6 +296,7 @@ def tray(a):
             args = ["python", str(HERE / "style_tray.py"), "--child", "--shm", str(self.shm), "--style", str(self.style),
                     "--cycle", str(CYCLE_S if self.cycle else 0), "--auto", "1" if self.auto else "0", "--vcam", a.vcam, "--vcam-size", a.vcam_size]
             if a.camera is not None: args += ["--camera", str(a.camera)]
+            for m in self.models: args += ["--model", m]
             p.setArguments(args)
             p.readyReadStandardOutput.connect(self.on_stdout); p.readyReadStandardError.connect(self.on_stderr)
             p.finished.connect(self.on_finished); p.errorOccurred.connect(self.on_error); p.start()
@@ -321,7 +332,7 @@ def tray(a):
                 self.style = m["style"]; self.a_style[self.style].setChecked(True)
             elif t == "status":
                 self.live = m.get("live", False)
-                name = TITLES[m.get("style", self.style)]
+                name = self.titles[m.get("style", self.style)]
                 if self.live:
                     who = "an app is watching" if m.get("watched") else "preview" if self.a_prev.isChecked() else "always on"
                     npu = f", NPU {m['ms']:.1f} ms" if m.get("ms") else ""
@@ -374,7 +385,7 @@ def tray(a):
             R = QSystemTrayIcon.ActivationReason
             if reason == R.Trigger: self.set_preview(not self.a_prev.isChecked())
             elif reason == R.MiddleClick:
-                i = self.style % len(STYLES) + 1; self.a_style[i].setChecked(True); self.set_style(i)
+                i = self.style % len(self.models) + 1; self.a_style[i].setChecked(True); self.set_style(i)
 
         def quit(self):
             self.quitting = True; self.preview.hide()
@@ -443,6 +454,7 @@ def main():
     ap.add_argument("--shot-after", type=float, default=12.0)
     ap.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--shm", help=argparse.SUPPRESS)
+    ap.add_argument("--model", action="append", help=argparse.SUPPRESS)
     ap.add_argument("--style", type=int, default=1, help=argparse.SUPPRESS)
     ap.add_argument("--cycle", type=float, default=0, help=argparse.SUPPRESS)
     ap.add_argument("--auto", type=int, default=1, help=argparse.SUPPRESS)

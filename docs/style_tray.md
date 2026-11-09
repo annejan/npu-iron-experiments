@@ -65,8 +65,8 @@ Chrome: Settings, Privacy and security, Site settings, Camera, or the camera ico
 | left click | preview window on or off (that turns the webcam and NPU on too) |
 | middle click | next style |
 | menu: Plain camera | the webcam without a filter, through the same path |
-| menu: Mosaic ... Pointillism | the five styles |
-| menu: Next style every 20 s | rotate through the five styles |
+| menu: Mosaic ... Pointillism | the five styles, then any `~/models/style/*/*-9.onnx` (for example Starry night, trained with `fun/style_train.py`) |
+| menu: Next style every 20 s | rotate through the styles |
 | menu: Only while an app uses the camera | on (default): webcam and NPU only during a call. Off: always live |
 | menu: Stop / Start virtual camera | stop the NPU part completely, or start it again |
 | menu: Quit | stop everything |

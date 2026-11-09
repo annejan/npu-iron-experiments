@@ -4,7 +4,7 @@ fast_neural_style models, here the ONNX zoo exports) as a 31-phase int8 pipeline
 
   ./env.sh python fun/style_cam.py --selftest                  COCO image: fp32 vs onnxruntime, int8 emulation, NPU
   ./env.sh python fun/style_cam.py --image in.jpg --out x.png  one picture, every style
-  ./env.sh python fun/style_cam.py --window                    live webcam (keys 1..5 pick the style, 0 input, ESC)
+  ./env.sh python fun/style_cam.py --window                    live webcam (keys 1..9 pick the style, 0 input, ESC)
   ./env.sh python fun/style_cam.py --bench                     NPU time per frame
   ./env.sh python fun/style_cam.py --vcam auto                 virtual webcam for Zoom/Jitsi/the browser (v4l2loopback),
                                                                headless; add --window to watch, --cycle 20 to rotate styles
@@ -41,6 +41,13 @@ SREC = 176                     # stats bytes read per conv core (128 used; 32 re
 COLS, ROWS = 8, 4
 NCORE = COLS * ROWS
 MODELS = Path.home() / "models" / "style" / "onnx-zoo"
+ZOO = ("mosaic", "candy", "rain-princess", "udnie", "pointilism")
+
+
+def style_models():
+    """The five zoo styles, then any other ~/models/style/<dir>/<name>-9.onnx (a style trained with style_train.py)."""
+    extra = sorted(p for p in MODELS.parent.glob("*/*-9.onnx") if p.parent != MODELS)
+    return [str(MODELS / f"{n}-9.onnx") for n in ZOO] + [str(p) for p in extra]
 EPS = 1e-5
 assert NWOBJ * ROWB == 4 * WREC and 4 * CREC == ROWB and NCORE * SREC == ROWB
 
@@ -1255,7 +1262,7 @@ def check(npu, img):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--model", action="append", help="style .onnx (repeatable; default: the five in ~/models/style/onnx-zoo)")
+    ap.add_argument("--model", action="append", help="style .onnx (repeatable; default: the five in ~/models/style/onnx-zoo, then ~/models/style/*/*-9.onnx)")
     ap.add_argument("--size", default="320x240")
     ap.add_argument("--phases", type=int, help="build only the first N phases (debug)")
     ap.add_argument("--check", action="store_true", help="compare the last built phase with the emulator on the test image")
@@ -1274,7 +1281,7 @@ def main():
     a = ap.parse_args()
     import cv2
     W, H = map(int, a.size.lower().split("x"))
-    models = a.model or [str(MODELS / f"{n}-9.onnx") for n in ("mosaic", "candy", "rain-princess", "udnie", "pointilism")]
+    models = a.model or style_models()
     if not (a.check or a.selftest or a.bench or a.image or a.window or a.still or a.vcam):
         ap.print_help(); return
     npu = StyleNPU(models[:1] if a.check else models, W, H, nphases=a.phases)
