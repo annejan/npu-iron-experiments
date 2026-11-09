@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-FileCopyrightText: 2026 Anne Jan Brouwer
+# SPDX-License-Identifier: MIT AND Apache-2.0 WITH LLVM-exception
 """YOLO26n object detection on the NPU from the webcam (or an image file), using the stock mlir-aie example.
 
   ./env.sh python fun/yolo_cam.py --image some.jpg        one image -> yolo_cam.png with boxes
@@ -12,8 +15,8 @@ tiles, every one of the 32 tiles) runs in one dispatch from a letterboxed 640x64
 detections (x1, y1, x2, y2, score, class). This script only adds the camera, the letterbox and the drawing.
 
 The Detector class is adapted from mlir-aie programming_examples/ml/yolo26n/yolo26n.py (main),
-Copyright (C) 2026 Advanced Micro Devices, Inc., SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-(LICENSES/Apache-2.0-WITH-LLVM-exception.txt); modified. The rest of this file: MIT, see LICENSE. No ultralytics
+Copyright (C) 2026 Advanced Micro Devices, Inc., Apache-2.0 WITH LLVM-exception (LICENSES/Apache-2.0.txt and
+LICENSES/LLVM-exception.txt); modified. The rest of this file: MIT, see LICENSE. No ultralytics
 code is used here: the letterbox is written from the description, the class names are COCO 2017's (Lin et al. 2014).
 The checkpoint (AGPL-3.0) and the quantized parameters derived from it are never part of this repository.
 """

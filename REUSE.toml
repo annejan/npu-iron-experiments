@@ -1,0 +1,48 @@
+version = 1
+SPDX-PackageName = "npu-iron-experiments"
+SPDX-PackageSupplier = "Anne Jan Brouwer"
+SPDX-PackageDownloadLocation = "https://github.com/annejan/npu-iron-experiments"
+
+# Everything not listed below: written here, MIT. A file's own SPDX header wins over this file (fun/yolo_cam.py).
+[[annotations]]
+path = "**"
+precedence = "closest"
+SPDX-FileCopyrightText = "2026 Anne Jan Brouwer"
+SPDX-License-Identifier = "MIT"
+
+# COCO 2017 image 30 (coco128): "Untitled" by julie, https://www.flickr.com/photos/roosterfarm/3573516590,
+# CC BY 2.0; modified (YOLO boxes drawn by the NPU / restyled by the NPU).
+[[annotations]]
+path = ["docs/img/yolo_coco.png", "docs/img/style_coco.png"]
+precedence = "override"
+SPDX-FileCopyrightText = ["julie (flickr.com/photos/roosterfarm)", "2026 Anne Jan Brouwer"]
+SPDX-License-Identifier = "CC-BY-2.0"
+
+# Renders of other people's boards with the Physarum router's copper on them (fun/physarum_route.py).
+# usb_mini_io from brainsmoke's usb_proto, https://github.com/brainsmoke/usb_proto, CC BY 4.0.
+[[annotations]]
+path = "docs/img/physarum_usb_mini_io*"
+precedence = "override"
+SPDX-FileCopyrightText = ["Erik Bosman (brainsmoke)", "2026 Anne Jan Brouwer"]
+SPDX-License-Identifier = "CC-BY-4.0"
+
+# The BornHack 2026 Cyber Aegg badge, https://github.com/badgeteam/bornhack2026-hardware, MIT.
+[[annotations]]
+path = "docs/img/physarum_bornhack2026*"
+precedence = "override"
+SPDX-FileCopyrightText = ["2025 Badge.Team", "2026 Anne Jan Brouwer"]
+SPDX-License-Identifier = "MIT"
+
+# The HackerHotel 2027 star badge, https://github.com/badgeteam/hackerhotel2027-hardware, CERN-OHL-P-2.0.
+[[annotations]]
+path = "docs/img/physarum_hackerhotel2027*"
+precedence = "override"
+SPDX-FileCopyrightText = ["Badge.Team contributors", "2026 Anne Jan Brouwer"]
+SPDX-License-Identifier = "CERN-OHL-P-2.0"
+
+# Kami, https://github.com/Nicolai-Electronics/kami-hardware, CERN-OHL-P-2.0.
+[[annotations]]
+path = "docs/img/physarum_kami*"
+precedence = "override"
+SPDX-FileCopyrightText = ["Renze Nicolai (Nicolai Electronics)", "2026 Anne Jan Brouwer"]
+SPDX-License-Identifier = "CERN-OHL-P-2.0"

@@ -1,5 +1,7 @@
 # IRON experiments on a Ryzen AI NPU
 
+[![REUSE](https://github.com/annejan/npu-iron-experiments/actions/workflows/reuse.yml/badge.svg)](https://github.com/annejan/npu-iron-experiments/actions/workflows/reuse.yml)
+
 One night (7 November 2026) of finding out what the NPU in an AMD Ryzen AI 7 PRO 350 laptop
 (a ThinkPad; XDNA2, AMD codename Krackan Point, `xrt-smi` calls it "NPU Krackan") is good at,
 programmed directly in IRON, the Python front end of AMD/Xilinx [mlir-aie](https://github.com/Xilinx/mlir-aie)
@@ -817,9 +819,12 @@ pad-to-pad distance and how much competition it meets along the way, binned into
 
 * The code in this repository is MIT (`LICENSE`), Copyright 2026 Anne Jan Brouwer. It was written
   with Claude Code; the commit trailers name the agent.
+* The repository follows the [REUSE](https://reuse.software) specification: `REUSE.toml` gives the copyright and
+  licence of every file that is not MIT, the licence texts are in `LICENSES/`, and CI runs `reuse lint` on every
+  push (`.github/workflows/reuse.yml`). Run it locally with `reuse lint`.
 * One exception: the `Detector` class in `fun/yolo_cam.py` is adapted from the mlir-aie example
   `programming_examples/ml/yolo26n/yolo26n.py`, Copyright 2026 Advanced Micro Devices, Inc.,
-  Apache-2.0 WITH LLVM-exception (`LICENSES/Apache-2.0-WITH-LLVM-exception.txt`).
+  Apache-2.0 WITH LLVM-exception (`LICENSES/Apache-2.0.txt`, `LICENSES/LLVM-exception.txt`).
 * [mlir-aie](https://github.com/Xilinx/mlir-aie) 1.4.5 (IRON, aie_api, the stock examples run
   here), the Peano compiler ([llvm-aie](https://github.com/Xilinx/llvm-aie)) and
   [XRT](https://github.com/Xilinx/XRT) are AMD/Xilinx projects under Apache-2.0 (with the LLVM
@@ -830,6 +835,13 @@ pad-to-pad distance and how much competition it meets along the way, binned into
 * `docs/img/yolo_coco.png` is COCO 2017 image 30 (coco128) with the NPU's boxes drawn on it:
   "Untitled" by julie (flickr.com/photos/roosterfarm/3573516590), CC BY 2.0, modified (boxes and
   labels added); COCO itself: Lin et al. 2014, annotations CC BY 4.0.
+* The Physarum router pictures show other people's boards with the router's copper on them:
+  `physarum_usb_mini_io*` is usb_mini_io from Erik Bosman's [usb_proto](https://github.com/brainsmoke/usb_proto)
+  (CC BY 4.0), `physarum_bornhack2026*` the BornHack 2026 Cyber Ægg by
+  [Badge.Team](https://github.com/badgeteam/bornhack2026-hardware) (MIT), `physarum_hackerhotel2027*` the
+  HackerHotel 2027 star badge by [Badge.Team](https://github.com/badgeteam/hackerhotel2027-hardware)
+  (CERN-OHL-P-2.0), and `physarum_kami*` Renze Nicolai's [Kami](https://github.com/Nicolai-Electronics/kami-hardware)
+  (CERN-OHL-P-2.0). The pictures carry those licences; the board files are not in this repo.
 * MNIST (`fun/mnist_npu.py`): Yann LeCun, Corinna Cortes, Christopher J.C. Burges, CC BY-SA 3.0; downloaded to
   `~/models/mnist` from the TensorFlow mirror, not redistributed. `docs/img/mnist_npu.png` shows weights learned
   from it and synthetic stars and a 7 drawn by the script, no MNIST images.
