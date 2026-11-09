@@ -15,7 +15,13 @@ batches of 4 crops of 256x256 (as pytorch/examples/fast_neural_style). Content i
 The network: 9x9 conv to 32 channels, two stride-2 3x3 convs to 128, five residual blocks, two nearest-upsample 3x3
 convs and a 9x9 conv to RGB, reflection padding, instance norm + ReLU after every conv but the last. Input and output
 are 0..255. The ONNX template is one of the zoo files; only the weights are replaced. A checkpoint (.pt, weights only)
-is kept next to the output so a run can be resumed (`--resume`).
+is kept next to the output so a run can be resumed (`--resume`). `--style-crop x0,y0,x1,y1` (fractions) trains on part
+of the painting: only the sky of The Starry Night, at `--style-size 256`, gives much bigger swirls.
+
+Downloads (by hand, once):
+  https://download.pytorch.org/models/vgg16-397923af.pth                  -> ~/models/vgg/
+  http://images.cocodataset.org/zips/val2017.zip                          -> unzip in ~/models/coco/
+  the painting, e.g. a 1280 px thumbnail from Wikimedia Commons (Google Art Project scans of public domain works)
 """
 import argparse, os, sys, time
 from pathlib import Path
@@ -115,9 +121,13 @@ def content_cache(data, size, limit=None):
     return arr
 
 
-def load_rgb(path, long_side=None):
+def load_rgb(path, long_side=None, crop=None):
+    """crop: x0,y0,x1,y1 as fractions of the picture, applied before the scaling."""
     import cv2
     im = cv2.cvtColor(cv2.imread(str(path)), cv2.COLOR_BGR2RGB)
+    if crop:
+        x0, y0, x1, y1 = crop; h, w = im.shape[:2]
+        im = im[round(y0 * h):round(y1 * h), round(x0 * w):round(x1 * w)]
     if long_side:
         s = long_side / max(im.shape[:2]); im = cv2.resize(im, (round(im.shape[1] * s), round(im.shape[0] * s)), interpolation=cv2.INTER_AREA)
     return im
@@ -160,6 +170,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--style", default=str(MODELS / "style/vangogh/starry-night-1280.jpg"))
     ap.add_argument("--style-size", type=int, default=512, help="long side of the style picture (smaller = bigger strokes)")
+    ap.add_argument("--style-crop", help="x0,y0,x1,y1 fractions: train on part of the painting (e.g. only the sky's swirls)")
     ap.add_argument("--data", default=str(MODELS / "coco/val2017"))
     ap.add_argument("--vgg", default=str(MODELS / "vgg/vgg16-397923af.pth"))
     ap.add_argument("--template", default=str(MODELS / "style/onnx-zoo/udnie-9.onnx"))
@@ -201,12 +212,12 @@ def main():
         return f @ f.transpose(1, 2) / (c * h * w)
 
     with torch.no_grad():
-        style_grams = [gram(f) for f in vgg(norm(to_t(load_rgb(a.style, a.style_size))))]
+        style_grams = [gram(f) for f in vgg(norm(to_t(load_rgb(a.style, a.style_size, a.style_crop and [float(v) for v in a.style_crop.split(",")]))))]
     data = content_cache(a.data, a.size) if not a.bench else np.random.randint(0, 255, (64, a.size, a.size, 3), np.uint8)
     rng = np.random.default_rng(step)
     prev = load_rgb(a.preview) if a.preview and Path(a.preview).exists() else None
     ac = (lambda: torch.autocast("cpu", torch.bfloat16)) if a.bf16 else (lambda: torch.autocast("cpu", enabled=False))
-    print(f"{len(data)} content crops, style {a.style} at {a.style_size}, {a.steps} steps of {a.batch}x{a.size}x{a.size}, "
+    print(f"{len(data)} content crops, style {a.style}{' crop ' + a.style_crop if a.style_crop else ''} at {a.style_size}, {a.steps} steps of {a.batch}x{a.size}x{a.size}, "
           f"{a.threads} threads{', bf16' if a.bf16 else ''}", flush=True)
 
     net.train(); t0 = time.perf_counter(); lc = ls = 0.0; n = 0

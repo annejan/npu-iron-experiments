@@ -177,6 +177,7 @@ Batch work per dispatch; keep one call per frame.
 | `dx7.py` | DX7-style FM synth: 512 six-operator voices, voices in the lanes, sine through the lookup unit, the 32 algorithms as data; `--window` plays it from the keyboard, bit-exact numpy replica, `dx7_demo.wav` |
 | `nam_amp.py` | Neural Amp Modeler guitar amps (`.nam` WaveNet captures) as a 16-core pipeline per amp, two amps at once; `--wav` renders a DI through amp and cab IR, `--live` is mic/line in to speakers at 1.3 ms blocks, `--selftest` / `--stages` compare with a float32 reference per core; see the section |
 | `style_cam.py` | fast neural style transfer (the five pytorch/examples styles from the ONNX zoo) as an int8 31-phase pipeline in one dispatch; `--window` live webcam (keys 1-5 pick the style, 0 shows the input), `--vcam auto` feeds a v4l2loopback virtual camera for video calls (load the module with `exclusive_caps=1`; `--cycle 20` rotates the styles), `--image` restyles a picture, `--selftest` checks every style against the int8 emulation, float32 and onnxruntime, `--phases N --check` one phase at a time; see the section |
+| `style_train.py` | trains a new style for `style_cam.py` on the CPU (torch, the pytorch/examples recipe), written as a zoo-compatible ONNX file; `--style-crop` trains on part of a painting; see "Your own styles" |
 | `style_tray.py` | the style camera as a tray icon (PyQt6, system Python): styles, cycling, preview, and the webcam and the NPU run only while an app streams from the virtual camera (v4l2loopback's client-usage event); guide in [docs/style_tray.md](docs/style_tray.md) |
 | `mnist_npu.py` | the NPU trains a neural network: MNIST, forward and backward pass and SGD update on all 32 cores, weights never leave the chip; `--epochs N`, `--selftest`, `--bench`, `--window` shows the first-layer weights forming and the accuracy climbing, classifies what you draw with the live weights, and learns new symbols you draw (keys A-F); see the section |
 | `pong_npu.py`, `breakout_npu.py` | the same trainer does REINFORCE: 128 games on the CPU, policy updates on the NPU; `--train N --gif x.gif --save w.npz`, `--window` to watch it learn, `--play w.npz` to play against what it learned; see the section for what it really learned |
@@ -528,6 +529,52 @@ join the reader, and Ctrl-C only sets a flag. After a reboot, openSUSE's `v4l2lo
 "OBS Virtual Camera" on the first free `/dev/video*`, which can come before the webcam. So the webcam is now found by
 its driver (never a loopback node, which would feed the filter its own output) instead of being index 0.
 
+### Your own styles: Van Gogh
+
+![van gogh](docs/img/style_vangogh.png)
+
+The five zoo styles are not the only ones: `fun/style_train.py` trains new ones with the recipe of pytorch/examples
+(Johnson et al.: VGG16 content loss at relu2_2, Gram-matrix style loss at relu1_2..relu4_3, content weight 1e5, style
+weight 1e10, Adam 1e-3, batches of four 256x256 crops; here from the 5000 COCO val2017 pictures). It writes the zoo's
+ONNX graph with the new weights, so the NPU plan, the int8 calibration and `--selftest` take the result as it is,
+and `style_cam.py` and the tray load every `~/models/style/*/*-9.onnx` after the five zoo styles (keys 6..9 in
+`--window`, more entries in the tray menu).
+
+Training runs on the CPU (the NPU design has no backward pass; torch here is a CPU build): bf16 autocast, 8 threads,
+1.04 s per step on the Ryzen AI 7 PRO 350, so 8000 steps take 2.3 hours. The three styles above, all painted by the
+NPU (int8, 16.5 ms per frame like the zoo styles):
+
+| style | trained | NPU vs emulation | NPU vs float32 |
+|---|---|---|---|
+| Starry night (The Starry Night, 1889, whole painting at 512 px) | 8000 steps from random | 50.7 dB | 36.8 dB |
+| Starry swirl (only the sky: `--style-crop 0.27,0,1,0.59`, at 256 px) | 3000 steps on from Starry night | 50.5 dB | 35.8 dB |
+| Self portrait (Self-Portrait, September 1889, at 512 px) | 8000 steps from random | 53.2 dB | 44.1 dB |
+
+The first Starry night has small swirls: the Gram loss sees texture at the scale the painting is given, and the
+village and the cypress dilute the sky. Training on the sky only, with the painting smaller (so a swirl covers more
+of a VGG receptive field), gives the big swirls and yellow star blobs; a stronger style weight (3e10 at 320 px) adds
+little more and loses detail. The soft self-portrait loses less to int8 than the chaotic swirls do (44 against 36 dB).
+
+The trained models are in the [`styles-v1` release](https://github.com/annejan/npu-iron-experiments/releases/tag/styles-v1)
+(MIT, 6.7 MB each):
+
+```
+gh release download styles-v1 -R annejan/npu-iron-experiments -D ~/models/style/vangogh -p '*.onnx'
+./env.sh python fun/style_cam.py --window          # 6 Self portrait, 7 Starry night, 8 Starry swirl (sorted by file name)
+```
+
+Training one yourself (the content pictures, VGG16 and the painting are downloaded by hand, see the script):
+
+```
+./env.sh python fun/style_train.py --style painting.jpg --out ~/models/style/mine/painting-9.onnx --bf16
+./env.sh python fun/style_train.py --style painting.jpg --style-crop 0.3,0,1,0.6 --style-size 256 \
+    --init ~/models/style/mine/painting-9.onnx --steps 3000 --out ~/models/style/mine/detail-9.onnx --bf16
+```
+
+A trap: `torchvision` in ironenv does not import (`operator torchvision::nms does not exist`: its build does not
+match torch 2.14), so the script defines VGG16's first 23 layers itself and loads torchvision's
+`vgg16-397923af.pth` state dict with `weights_only=True`.
+
 Costs that are left: 123 MB in and 65 MB out of DDR per frame (a 5632-byte object for every row window, which
 wastes most of it for the 8-channel input of conv1 and the 32-channel layers), 1632 DMA transfers. Live, the
 laptop camera is the limit at night (12.5 fps alone, 9.5 fps with the NPU call holding the GIL).
@@ -845,7 +892,13 @@ pad-to-pad distance and how much competition it meets along the way, binned into
 * MNIST (`fun/mnist_npu.py`): Yann LeCun, Corinna Cortes, Christopher J.C. Burges, CC BY-SA 3.0; downloaded to
   `~/models/mnist` from the TensorFlow mirror, not redistributed. `docs/img/mnist_npu.png` shows weights learned
   from it and synthetic stars and a 7 drawn by the script, no MNIST images.
-* `docs/img/style_coco.png` is the same photo restyled by the NPU. The five style networks are the
+* `docs/img/style_coco.png` and `docs/img/style_vangogh.png` are the same photo restyled by the NPU. The Van Gogh
+  styles were trained here from The Starry Night (1889, MoMA) and the Self-Portrait of September 1889 (Musée
+  d'Orsay), both public domain, as photographed by the Google Art Project (Wikimedia Commons); the paintings are not
+  in this repo. The content pictures were COCO val2017 (Lin et al. 2014; not redistributed), the loss network
+  torchvision's VGG16 ImageNet weights (BSD-3-Clause; not redistributed). The trained weights in the `styles-v1`
+  release are MIT, Copyright 2026 Anne Jan Brouwer.
+* The five style networks are the
   [pytorch/examples fast_neural_style](https://github.com/pytorch/examples/tree/main/fast_neural_style) models
   (BSD-3-Clause) as exported to the [ONNX Model Zoo](https://github.com/onnx/models/tree/main/validated/vision/style_transfer/fast_neural_style)
   (BSD-3-Clause); they are not in this repo. Method: Johnson, Alahi, Fei-Fei, "Perceptual Losses for Real-Time
