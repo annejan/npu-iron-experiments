@@ -175,7 +175,7 @@ Batch work per dispatch; keep one call per frame.
 | `dx7.py` | DX7-style FM synth: 512 six-operator voices, voices in the lanes, sine through the lookup unit, the 32 algorithms as data; `--window` plays it from the keyboard, bit-exact numpy replica, `dx7_demo.wav` |
 | `nam_amp.py` | Neural Amp Modeler guitar amps (`.nam` WaveNet captures) as a 16-core pipeline per amp, two amps at once; `--wav` renders a DI through amp and cab IR, `--live` is mic/line in to speakers at 1.3 ms blocks, `--selftest` / `--stages` compare with a float32 reference per core; see the section |
 | `style_cam.py` | fast neural style transfer (the five pytorch/examples styles from the ONNX zoo) as an int8 31-phase pipeline in one dispatch; `--window` live webcam (keys 1-5 pick the style, 0 shows the input), `--vcam auto` feeds a v4l2loopback virtual camera for video calls (load the module with `exclusive_caps=1`; `--cycle 20` rotates the styles), `--image` restyles a picture, `--selftest` checks every style against the int8 emulation, float32 and onnxruntime, `--phases N --check` one phase at a time; see the section |
-| `style_tray.py` | the style camera as a tray icon (PyQt6, system Python): styles, cycling, preview, and the webcam and the NPU run only while an app streams from the virtual camera (v4l2loopback's client-usage event); see the style section |
+| `style_tray.py` | the style camera as a tray icon (PyQt6, system Python): styles, cycling, preview, and the webcam and the NPU run only while an app streams from the virtual camera (v4l2loopback's client-usage event); guide in [docs/style_tray.md](docs/style_tray.md) |
 | `mnist_npu.py` | the NPU trains a neural network: MNIST, forward and backward pass and SGD update on all 32 cores, weights never leave the chip; `--epochs N`, `--selftest`, `--bench`, `--window` shows the first-layer weights forming and the accuracy climbing, classifies what you draw with the live weights, and learns new symbols you draw (keys A-F); see the section |
 | `pong_npu.py`, `breakout_npu.py` | the same trainer does REINFORCE: 128 games on the CPU, policy updates on the NPU; `--train N --gif x.gif --save w.npz`, `--window` to watch it learn, `--play w.npz` to play against what it learned; see the section for what it really learned |
 | `probe/plasma.py` | 3-sine plasma, `--window` |
@@ -507,7 +507,8 @@ Measured through a real loopback: a reader (ffmpeg, Chrome) gets 640x480 YU12 at
 <img src="docs/img/style_tray_menu.png" width="240" align="right" alt="the tray menu">
 
 As a tray icon, for daily use: `python3 fun/style_tray.py` (any Python with PyQt6, e.g. the system one; it starts the
-NPU part in ironenv through `./env.sh`). The menu has the five styles and the plain camera, cycling, a preview window
+NPU part in ironenv through `./env.sh`). Setup (also a loopback name that stays after a reboot), use, autostart and
+problems: **[docs/style_tray.md](docs/style_tray.md)**. The menu has the five styles and the plain camera, cycling, a preview window
 (also a left click on the icon; a middle click picks the next style), stop/start and quit. The icon shows the live
 picture. The webcam and the NPU run only while an app streams from the virtual camera: v4l2loopback (0.15.4 here)
 sends the writer a private event, `V4L2_EVENT_PRIVATE_START + 0x08E00000 + 1`, with a count of 1 on a reader's
