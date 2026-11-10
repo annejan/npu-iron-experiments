@@ -176,7 +176,7 @@ Batch work per dispatch; keep one call per frame.
 | `patterns.py` | RLE helper with the classic Life objects for `life_window.py` (no main) |
 | `dx7.py` | DX7-style FM synth: 512 six-operator voices, voices in the lanes, sine through the lookup unit, the 32 algorithms as data; `--window` plays it from the keyboard, bit-exact numpy replica, `dx7_demo.wav` |
 | `nam_amp.py` | Neural Amp Modeler guitar amps (`.nam` WaveNet captures) as a 16-core pipeline per amp, two amps at once; `--wav` renders a DI through amp and cab IR, `--live` is mic/line in to speakers at 1.3 ms blocks, `--selftest` / `--stages` compare with a float32 reference per core; see the section |
-| `style_cam.py` | fast neural style transfer (the five pytorch/examples styles from the ONNX zoo) as an int8 31-phase pipeline in one dispatch; `--window` live webcam (keys 1-5 pick the style, 0 shows the input), `--vcam auto` feeds a v4l2loopback virtual camera for video calls (load the module with `exclusive_caps=1`; `--cycle 20` rotates the styles), `--image` restyles a picture, `--selftest` checks every style against the int8 emulation, float32 and onnxruntime, `--phases N --check` one phase at a time; see the section |
+| `style_cam.py` | fast neural style transfer (the five pytorch/examples styles from the ONNX zoo) as an int8 31-phase pipeline in one dispatch; `--window` live webcam (keys 1-9 or the arrow keys pick the style, 0 shows the input), `--vcam auto` feeds a v4l2loopback virtual camera for video calls (load the module with `exclusive_caps=1`; `--cycle 20` rotates the styles), `--image` restyles a picture, `--selftest` checks every style against the int8 emulation, float32 and onnxruntime, `--phases N --check` one phase at a time; see the section |
 | `style_train.py` | trains a new style for `style_cam.py` on the CPU (torch, the pytorch/examples recipe), written as a zoo-compatible ONNX file; `--style-crop` trains on part of a painting; see "Your own styles" |
 | `style_tray.py` | the style camera as a tray icon (PyQt6, system Python): styles, cycling, preview, and the webcam and the NPU run only while an app streams from the virtual camera (v4l2loopback's client-usage event); guide in [docs/style_tray.md](docs/style_tray.md) |
 | `mnist_npu.py` | the NPU trains a neural network: MNIST, forward and backward pass and SGD update on all 32 cores, weights never leave the chip; `--epochs N`, `--selftest`, `--bench`, `--window` shows the first-layer weights forming and the accuracy climbing, classifies what you draw with the live weights, and learns new symbols you draw (keys A-F); see the section |
@@ -575,6 +575,41 @@ A trap: `torchvision` in ironenv does not import (`operator torchvision::nms doe
 match torch 2.14), so the script defines VGG16's first 23 layers itself and loads torchvision's
 `vgg16-397923af.pth` state dict with `weights_only=True`.
 
+### Your own styles: Hokusai and Munch
+
+![hokusai and munch](docs/img/style_hokusai_munch.png)
+
+Two more painters, three styles each, all painted by the NPU from the same photo. These started from the Starry
+night weights instead of random (`--init`), which halves the steps to 4000; nothing of Van Gogh is left after the
+first 1000. Four of them trained two at a time (4 threads each, 2 to 3 s per step, so about 3 hours for a pair).
+
+| style | trained | NPU vs emulation | NPU vs float32 |
+|---|---|---|---|
+| Great wave (Hokusai, The Great Wave, c. 1831, whole print at 512 px) | 4000 steps from Starry night | 49.0 dB | 38.2 dB |
+| Wave foam (only the wave: `--style-crop 0,0.08,0.6,1`, at 320 px) | 4000 steps from Starry night | 47.4 dB | 33.3 dB |
+| Wave calm (the same crop at 448 px, style weight 6e9) | 2000 steps on from Wave foam | 48.0 dB | 35.1 dB |
+| The scream (Munch, The Scream, 1893, at 512 px) | 4000 steps from Starry night | 54.3 dB | 46.6 dB |
+| Scream sky (only the sky: `--style-crop 0,0,0.94,0.42`, at 320 px) | 4000 steps from Starry night | 54.5 dB | 44.2 dB |
+| Scream bold (as The scream, style weight 3e10) | 1500 steps on from The scream | 54.3 dB | 45.7 dB |
+
+Hokusai's print has a strong repeating texture (the claws of foam), and the network copies it everywhere, sky and
+railing included. A bigger style picture and a lower style weight (Wave calm) give fewer, bigger curls, but only a
+little calmer. Munch is the other way round: The Scream is mostly smooth colour fields, so the Gram matrices are
+matched early (the style loss is a third of Hokusai's) and the result is the palette with soft strokes, not the
+painting's swirls. Three times the style weight halves the style loss but hardly shows; the sky alone, smaller,
+gives the most Munch. Like the self-portrait, the soft styles lose the least to int8 (46 dB against 33 for the foam).
+
+The trained models are in the [`styles-v2` release](https://github.com/annejan/npu-iron-experiments/releases/tag/styles-v2)
+(MIT, 6.7 MB each):
+
+```
+gh release download styles-v2 -R annejan/npu-iron-experiments -D ~/models/style/hokusai -p 'great-wave-9.onnx' -p 'wave-*-9.onnx'
+gh release download styles-v2 -R annejan/npu-iron-experiments -D ~/models/style/munch -p '*scream*-9.onnx'
+```
+
+With all three releases there are 14 styles; in `--window` the keys 1-9 pick the first nine and the arrow keys
+(or space) step through all of them.
+
 Costs that are left: 123 MB in and 65 MB out of DDR per frame (a 5632-byte object for every row window, which
 wastes most of it for the 8-channel input of conv1 and the 32-channel layers), 1632 DMA transfers. Live, the
 laptop camera is the limit at night (12.5 fps alone, 9.5 fps with the NPU call holding the GIL).
@@ -892,12 +927,17 @@ pad-to-pad distance and how much competition it meets along the way, binned into
 * MNIST (`fun/mnist_npu.py`): Yann LeCun, Corinna Cortes, Christopher J.C. Burges, CC BY-SA 3.0; downloaded to
   `~/models/mnist` from the TensorFlow mirror, not redistributed. `docs/img/mnist_npu.png` shows weights learned
   from it and synthetic stars and a 7 drawn by the script, no MNIST images.
-* `docs/img/style_coco.png` and `docs/img/style_vangogh.png` are the same photo restyled by the NPU. The Van Gogh
+* `docs/img/style_coco.png`, `docs/img/style_vangogh.png` and `docs/img/style_hokusai_munch.png` are the same photo
+  restyled by the NPU. The Van Gogh
   styles were trained here from The Starry Night (1889, MoMA) and the Self-Portrait of September 1889 (Musée
   d'Orsay), both public domain, as photographed by the Google Art Project (Wikimedia Commons); the paintings are not
   in this repo. The content pictures were COCO val2017 (Lin et al. 2014; not redistributed), the loss network
   torchvision's VGG16 ImageNet weights (BSD-3-Clause; not redistributed). The trained weights in the `styles-v1`
   release are MIT, Copyright 2026 Anne Jan Brouwer.
+* The Hokusai and Munch styles were trained here from Katsushika Hokusai's Under the Wave off Kanagawa (c. 1830-32,
+  Metropolitan Museum of Art 45434) and Edvard Munch's The Scream (1893, National Museum, Oslo, NG.M.00939), both
+  public domain (Wikimedia Commons); the pictures are not in this repo. Same content pictures and loss network as
+  above. The trained weights in the `styles-v2` release are MIT, Copyright 2026 Anne Jan Brouwer.
 * The five style networks are the
   [pytorch/examples fast_neural_style](https://github.com/pytorch/examples/tree/main/fast_neural_style) models
   (BSD-3-Clause) as exported to the [ONNX Model Zoo](https://github.com/onnx/models/tree/main/validated/vision/style_transfer/fast_neural_style)

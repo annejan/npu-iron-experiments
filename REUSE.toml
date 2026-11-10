@@ -13,7 +13,7 @@ SPDX-License-Identifier = "MIT"
 # COCO 2017 image 30 (coco128): "Untitled" by julie, https://www.flickr.com/photos/roosterfarm/3573516590,
 # CC BY 2.0; modified (YOLO boxes drawn by the NPU / restyled by the NPU).
 [[annotations]]
-path = ["docs/img/yolo_coco.png", "docs/img/style_coco.png", "docs/img/style_vangogh.png"]
+path = ["docs/img/yolo_coco.png", "docs/img/style_coco.png", "docs/img/style_vangogh.png", "docs/img/style_hokusai_munch.png"]
 precedence = "override"
 SPDX-FileCopyrightText = ["julie (flickr.com/photos/roosterfarm)", "2026 Anne Jan Brouwer"]
 SPDX-License-Identifier = "CC-BY-2.0"

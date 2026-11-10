@@ -4,7 +4,7 @@ fast_neural_style models, here the ONNX zoo exports) as a 31-phase int8 pipeline
 
   ./env.sh python fun/style_cam.py --selftest                  COCO image: fp32 vs onnxruntime, int8 emulation, NPU
   ./env.sh python fun/style_cam.py --image in.jpg --out x.png  one picture, every style
-  ./env.sh python fun/style_cam.py --window                    live webcam (keys 1..9 pick the style, 0 input, ESC)
+  ./env.sh python fun/style_cam.py --window                    live webcam (1..9 or arrows/space pick the style, 0 input, ESC)
   ./env.sh python fun/style_cam.py --bench                     NPU time per frame
   ./env.sh python fun/style_cam.py --vcam auto                 virtual webcam for Zoom/Jitsi/the browser (v4l2loopback),
                                                                headless; add --window to watch, --cycle 20 to rotate styles
@@ -1354,6 +1354,8 @@ def main():
                     if e.type == pygame.QUIT or (e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE): return
                     if e.type == pygame.KEYDOWN and pygame.K_1 <= e.key <= pygame.K_9 and e.key - pygame.K_1 < len(npu.nets): style = e.key - pygame.K_1
                     if e.type == pygame.KEYDOWN and e.key == pygame.K_0: show_in = not show_in
+                    if e.type == pygame.KEYDOWN and e.key in (pygame.K_RIGHT, pygame.K_SPACE): style = (style + 1) % len(npu.nets)
+                    if e.type == pygame.KEYDOWN and e.key == pygame.K_LEFT: style = (style - 1) % len(npu.nets)
             now = time.perf_counter()
             if a.cycle and now - t_style > a.cycle: style = (style + 1) % len(npu.nets); t_style = now
             rgb, latest[0] = latest[0], None
@@ -1367,7 +1369,7 @@ def main():
                 continue
             frame = cv2.resize(out, (W * scale, H * scale), interpolation=cv2.INTER_LINEAR) if scale != 1 else out
             screen.blit(pygame.surfarray.make_surface(np.transpose(frame, (1, 0, 2))), (0, 0))
-            screen.blit(font.render(f"{npu.nets[style].name} on the NPU: {npu.ms:.1f} ms  {n / (time.perf_counter() - t0):.1f} fps  (1-{len(npu.nets)} style, 0 input, ESC)", True, (255, 255, 0)), (8, 8))
+            screen.blit(font.render(f"{npu.nets[style].name} on the NPU: {npu.ms:.1f} ms  {n / (time.perf_counter() - t0):.1f} fps  ({style + 1}/{len(npu.nets)}, 1-9 or arrows style, 0 input, ESC)", True, (255, 255, 0)), (8, 8))
             pygame.display.flip()
     except KeyboardInterrupt:
         pass
